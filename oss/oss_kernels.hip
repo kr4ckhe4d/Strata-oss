@@ -1052,6 +1052,132 @@ __global__ void __launch_bounds__(128) k_attn_prompt_wmma(const float* __restric
 #endif
 }
 
+// int8 WMMA versions of the prompt MoE kernels (gfx12): the same tiles (32 tokens of one expert), 4 waves a block.
+// MATS = 2: gate and up (16 rows a wave each, act = swiglu written); MATS = 1: down (32 rows a wave, y written).
+// Per 32-value block: two 16x16x16 int8 WMMAs into an int tile, then the block's two scales (weight row, token).
+typedef int v2i __attribute__((ext_vector_type(2)));
+typedef int v8i __attribute__((ext_vector_type(8)));
+template <int MATS, int RSUB>
+__global__ void __launch_bounds__(128) k_mmq_wmma(const uint8_t* const* __restrict__ wptr,
+                                                  const int4* __restrict__ tiles, int tile0,
+                                                  const int8_t* __restrict__ xq, const float* __restrict__ xd,
+                                                  const float* __restrict__ b0p, const float* __restrict__ b1p,
+                                                  float* __restrict__ outp, int n_in, int n_out, size_t mat_off,
+                                                  size_t mat_stride) {
+#if defined(OSS_WMMA)
+    constexpr int KB = 4, WR = 16 * RSUB, TM = 4 * WR, RP = KB * 32 + 8;
+    __shared__ int8_t W[MATS][TM][RP];
+    __shared__ float Wd[MATS][TM][KB];
+    __shared__ int8_t X[kTN][RP];
+    __shared__ float Xd[kTN][KB];
+    const int4 tl = tiles[tile0 + blockIdx.y];
+    const int e = tl.x, r0 = tl.y, nt = tl.z;
+    const int row0 = blockIdx.x * TM;
+    const int nb = n_in / 32;
+    const uint8_t* mat0 = wptr[e] + mat_off;
+    const int wv = threadIdx.x / WS, lane = threadIdx.x % WS, lr = lane % 16, lh = lane / 16;
+    float acc[MATS][RSUB][2][8];
+#pragma unroll
+    for (int m = 0; m < MATS; ++m)
+#pragma unroll
+        for (int rs = 0; rs < RSUB; ++rs)
+#pragma unroll
+            for (int ns = 0; ns < 2; ++ns)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[m][rs][ns][i] = 0.f;
+    for (int b0 = 0; b0 < nb; b0 += KB) {
+        for (int idx = threadIdx.x; idx < MATS * TM * KB; idx += blockDim.x) {
+            const int m = idx / (TM * KB), rem = idx % (TM * KB), r = rem / KB, kb = rem % KB;
+            const int row = row0 + r, b = b0 + kb;
+            int* dst = (int*) &W[m][r][kb * 32];
+            if (row < n_out && b < nb) {
+                const uint8_t* base = mat0 + m * mat_stride;
+                const uint4 qv = ((const uint4*) base)[(size_t) row * nb + b];
+                const uint32_t q[4] = {qv.x, qv.y, qv.z, qv.w};
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    const int2 v = mxfp4_lut(q[l]);
+                    dst[l] = v.x;
+                    dst[l + 4] = v.y;
+                }
+                Wd[m][r][kb] = e8m0_half(base[(size_t) n_out * nb * 16 + (size_t) row * nb + b]);
+            } else {
+#pragma unroll
+                for (int l = 0; l < 8; ++l) dst[l] = 0;
+                Wd[m][r][kb] = 0.f;
+            }
+        }
+        for (int idx = threadIdx.x; idx < kTN * KB * 2; idx += blockDim.x) {
+            const int tok = idx / (KB * 2), rem = idx % (KB * 2), kb = rem / 2, hh = rem % 2;
+            const int b = b0 + kb;
+            int4 v = make_int4(0, 0, 0, 0);
+            if (tok < nt && b < nb) v = *(const int4*) (xq + (size_t) (r0 + tok) * n_in + b * 32 + hh * 16);
+            *(int4*) &X[tok][kb * 32 + hh * 16] = v;
+            if (hh == 0) Xd[tok][kb] = (tok < nt && b < nb) ? xd[(size_t) (r0 + tok) * nb + b] : 0.f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kb = 0; kb < KB; ++kb) {
+            v2i bx[2][2];
+#pragma unroll
+            for (int ns = 0; ns < 2; ++ns) {
+                bx[ns][0] = *(const v2i*) &X[ns * 16 + lr][kb * 32 + 8 * lh];
+                bx[ns][1] = *(const v2i*) &X[ns * 16 + lr][kb * 32 + 16 + 8 * lh];
+            }
+#pragma unroll
+            for (int m = 0; m < MATS; ++m)
+#pragma unroll
+                for (int rs = 0; rs < RSUB; ++rs) {
+                    const int rb = wv * WR + rs * 16;
+                    const v2i a0 = *(const v2i*) &W[m][rb + lr][kb * 32 + 8 * lh];
+                    const v2i a1 = *(const v2i*) &W[m][rb + lr][kb * 32 + 16 + 8 * lh];
+#pragma unroll
+                    for (int ns = 0; ns < 2; ++ns) {
+                        v8i ci = {};
+                        ci = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a0, true, bx[ns][0], ci, false);
+                        ci = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a1, true, bx[ns][1], ci, false);
+                        const float xs = Xd[ns * 16 + lr][kb];
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) acc[m][rs][ns][i] += Wd[m][rb + 8 * lh + i][kb] * xs * (float) ci[i];
+                    }
+                }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int rs = 0; rs < RSUB; ++rs)
+#pragma unroll
+        for (int ns = 0; ns < 2; ++ns) {
+            const int tok = ns * 16 + lr;
+            if (tok >= nt) continue;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int row = row0 + wv * WR + rs * 16 + 8 * lh + i;
+                if (row >= n_out) continue;
+                if (MATS == 2) {
+                    const float g = acc[0][rs][ns][i] + b0p[(size_t) e * n_out + row];
+                    const float u = acc[MATS - 1][rs][ns][i] + b1p[(size_t) e * n_out + row];
+                    outp[(size_t) (r0 + tok) * n_out + row] = swiglu_oai(g, u);
+                } else {
+                    outp[(size_t) (r0 + tok) * n_out + row] = acc[0][rs][ns][i];
+                }
+            }
+        }
+#endif
+}
+
+bool use_mmq_wmma() {
+    static const bool v = [] {
+        int dev = 0;
+        hipDeviceProp_t pr;
+        (void) hipGetDevice(&dev);
+        (void) hipGetDeviceProperties(&pr, dev);
+        const char* env = std::getenv("OSS_MMQ_WMMA");
+        return (env ? std::atoi(env) != 0 : true) && std::strncmp(pr.gcnArchName, "gfx120", 6) == 0;
+    }();
+    return v;
+}
+
 unsigned cdiv(size_t a, size_t b) { return (unsigned) ((a + b - 1) / b); }
 
 } // namespace
@@ -1230,6 +1356,12 @@ void mmq_gate_up(const uint8_t* const* wptr, const int32_t* tiles, int tile0, in
                  const float* xd, const float* gate_b, const float* up_b, float* act, int n_embd, int n_ff,
                  hipStream_t s) {
     if (ntiles <= 0) return;
+    if (use_mmq_wmma()) {
+        const size_t mat = (size_t) n_ff * (n_embd / 32) * 17;
+        hipLaunchKernelGGL((k_mmq_wmma<2, 1>), dim3(cdiv(n_ff, 64), ntiles), dim3(128), 0, s, wptr, (const int4*) tiles,
+                           tile0, xq, xd, gate_b, up_b, act, n_embd, n_ff, (size_t) 0, mat);
+        return;
+    }
     hipLaunchKernelGGL(k_mmq_gate_up, dim3(cdiv(n_ff, 64), ntiles), dim3(256), 0, s, wptr, (const int4*) tiles, tile0,
                        xq, xd, gate_b, up_b, act, n_embd, n_ff);
 }
@@ -1237,6 +1369,13 @@ void mmq_gate_up(const uint8_t* const* wptr, const int32_t* tiles, int tile0, in
 void mmq_down(const uint8_t* const* wptr, const int32_t* tiles, int tile0, int ntiles, const int8_t* aq,
               const float* ad, float* y, int n_embd, int n_ff, hipStream_t s) {
     if (ntiles <= 0) return;
+    if (use_mmq_wmma()) {
+        const size_t gu = 2 * (size_t) n_ff * (n_embd / 32) * 17;
+        hipLaunchKernelGGL((k_mmq_wmma<1, 2>), dim3(cdiv(n_embd, 128), ntiles), dim3(128), 0, s, wptr,
+                           (const int4*) tiles, tile0, aq, ad, (const float*) nullptr, (const float*) nullptr, y, n_ff,
+                           n_embd, gu, (size_t) 0);
+        return;
+    }
     hipLaunchKernelGGL(k_mmq_down, dim3(cdiv(n_embd, 128), ntiles), dim3(256), 0, s, wptr, (const int4*) tiles, tile0,
                        aq, ad, y, n_embd, n_ff);
 }

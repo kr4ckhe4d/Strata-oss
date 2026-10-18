@@ -146,3 +146,34 @@ Prompt speed at long context is unchanged (16K 857, 32K 570 tok/s): that is `k_a
 | --- | ---: | ---: |
 | 16K tokens | 857 tok/s | 1,549 tok/s |
 | 32K tokens | 570 tok/s | 1,412 tok/s |
+
+## 11. int8 WMMA for the prompt's experts, and the PCIe wall
+
+- int8 WMMA (`__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12`) has the same fragment layout as the f16 one (checked
+  exact). The expert kernels now do two 16x16x16 int8 WMMAs per 32-value block into an int tile, then apply the
+  block's two scales (weight row's E8M0, token's int8 scale) in float. Same tiles as the dp4a kernels
+  (`OSS_MMQ_WMMA=0` keeps those). 20b, 2,000 tokens, half the experts in RAM: KL 0.008 vs dp4a, perplexity 23.43 vs
+  23.48.
+- 120b 16K prompt: experts 5.85 s -> 4.49 s, prompt 1,544 -> 1,782 tok/s. Less than the WMMA speed-up because
+  **PCIe is now the wall**: both GPUs sit on PCIe 5.0 x8 CPU links (x8/x8 split; idle reads 2.5 GT/s, power saving),
+  measured 28.7 GB/s pinned host -> GPU each. A 16K prompt in 2,048-token chunks streams 7,660 expert copies
+  (each missing expert once per chunk per layer) = 96 GB = ~3.4 s of pure transfer.
+- So the lever is the chunk: each missing expert crosses PCIe once per chunk, whatever the chunk's size.
+- **Gotcha (mine): `/tmp` is a 16 GB tmpfs (RAM) on this PC, and swap is zram (compressed RAM).** 13 logits dumps
+  (9.4 GB) in the scratchpad pushed the engine into swap: a 4K-chunk run crawled for 10 min with RAM at 0 free.
+  Reference dumps now live on the SSD (`/mnt/fast/models/oss-test/`). With 30 GB of RAM and a 16 GB expert arena,
+  anything else large in RAM costs real speed.
+
+## 12. Prompt chunk size (120b, after the WMMA kernels)
+
+| chunk | VRAM slots | 16K prompt | 32K prompt | output 16K / 32K ctx |
+| --- | ---: | ---: | ---: | ---: |
+| 2,048 | 3,231 | 1,813 | 1,633 | 81.9 / 71.2 |
+| 4,096 | 3,171 | 1,981 | 1,768 | 81.1 / 70.7 |
+| 8,192 | 3,050 | 2,104 | 1,871 | 78.8 / 69.3 |
+
+- Bigger chunks help less than the PCIe arithmetic predicted (halving the streamed bytes saved ~0.8 s of ~3.4 s at
+  16K), so the copies were already partly hidden behind the VRAM experts' compute; the rest of the prompt time is
+  now spread over dense projections (hipBLAS, ~3 s at 16K), attention and experts.
+- A bigger chunk's scratch takes VRAM from the expert cache (60 slots per doubling at 4K, 120 at 8K), which costs
+  output speed: 8K -4%. Default is now 4,096 (+9% prompts, -1% output); `--chunk 8192` for long-document work.

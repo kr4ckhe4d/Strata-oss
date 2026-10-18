@@ -16,7 +16,7 @@ struct Options {
     std::vector<int> split;          // layers per GPU (empty: by free VRAM)
     int ctx = 32768;                 // max context
     int swa_slack = 8192;            // a sliding-window layer keeps window + this many positions (rollback room)
-    int chunk = 2048;                // prompt chunk
+    int chunk = 4096;                // prompt chunk (measured: oss/FINDINGS.md section 12)
     int threads = 0;                 // CPU workers (0: physical cores)
     double reserve_mib = 768;        // VRAM left free per GPU
     int64_t max_slots = -1;          // cap on expert slots in total (tests)

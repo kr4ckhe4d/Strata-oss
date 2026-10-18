@@ -233,6 +233,7 @@ int main(int argc, char** argv) {
         else if (a == "--n-predict") n_predict = std::atoi(next().c_str());
         else if (a == "--dump-logits") { dump = next(); mode = "dump"; }
         else if (a == "--serve") mode = "serve";
+        else if (a == "--bench-verify") mode = "verify";
         else if (a == "-v") o.verbose = true;
         else { usage(); return 2; }
     }
@@ -247,6 +248,32 @@ int main(int argc, char** argv) {
             FILE* f = std::fopen(dump.c_str(), "wb");
             std::fwrite(lg, sizeof(float), ids.size() * (size_t) V, f);
             std::fclose(f);
+            eng.report(stderr);
+            return 0;
+        }
+        if (mode == "verify") {
+            // the cost of a decode step that checks nc tokens at once (a speculative verify window)
+            auto ids = read_ids(tokens_file);
+            eng.set_busy(true);
+            eng.eval(ids);
+            std::vector<int32_t> probe(ids.begin(), ids.end());
+            probe.push_back(-1);
+            const std::vector<int32_t> words = {13, 290, 326, 316, 382, 261, 11, 328};
+            for (int nc : {1, 2, 3, 4, 6, 8}) {
+                double best = 1e9, sum = 0;
+                const int reps = 24;
+                for (int r = 0; r < reps; ++r) {
+                    eng.reuse_prefix(probe);
+                    std::vector<int32_t> w(words.begin(), words.begin() + nc);
+                    for (auto& x : w) x += r;  // vary the tokens a little
+                    const auto t0 = std::chrono::steady_clock::now();
+                    eng.eval(w);
+                    const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    if (r >= 4) { best = std::min(best, dt); sum += dt; }
+                }
+                std::fprintf(stderr, "verify window %d tokens: %.2f ms a step (best %.2f), %.2f ms a token\n", nc,
+                             1e3 * sum / (reps - 4), 1e3 * best, 1e3 * sum / (reps - 4) / nc);
+            }
             eng.report(stderr);
             return 0;
         }

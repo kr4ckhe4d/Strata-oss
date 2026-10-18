@@ -112,3 +112,21 @@ Standard library only; `strata-oss --serve` underneath (JSON lines). Checked wit
   attention reduces each key across a wave (5 shuffles a key). Both are the next kernels to rewrite.
 - Short prompts are dominated by fixed per-layer costs (the router sync, dequant of the dense weights to f16 for
   hipBLAS): 80 tokens take 0.3-0.4 s.
+
+## 9. Decode attention rewrite (long context)
+
+Before: a wave per query head walked the keys one at a time, each key's 64-dim dot reduced across the wave with 5
+shuffles, with an online-softmax rescale per key. At 32K context that cost ~0.4 ms per full-attention layer
+(output 80 -> 52 tok/s from short to 32K).
+After: the split's K and V (128 keys) are staged once in LDS per kv head (8 query heads share them; rows padded by
+2 halves so a lane-per-key read does not hit one bank), a lane scores its own keys, one max/sum per split, the
+probabilities go through LDS for the V sum.
+
+| 120b context | output before | output after |
+| --- | ---: | ---: |
+| 16K | 65.4 | 81.5 |
+| 32K | 51.8 | 70.8 |
+
+Also closer to llama.cpp's one-token path on 20b: KL 0.054 -> 0.029, top-1 90.5% -> 91.7%; the per-key online
+rescale was the noisier formulation (the KL 5.6 outlier at position 160 is gone).
+Prompt speed at long context is unchanged (16K 857, 32K 570 tok/s): that is `k_attn_prompt`, next.

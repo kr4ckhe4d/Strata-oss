@@ -244,13 +244,20 @@ __global__ void k_rope_store(float* __restrict__ qkv, uint16_t* __restrict__ kc,
 }
 
 // ------------------------------------------------------------------------------------------------ decode attention
-constexpr int kSplit = 256;   // keys per split block
+constexpr int kSplit = 128;   // keys per split block
 constexpr int kHD = 64;       // head dim (checked at load)
 
-// grid (nkv, max_splits, ncols), block (nh/nkv) warps; a warp per query head of the group
-__global__ void k_attn_split(const float* __restrict__ qkv, const uint16_t* __restrict__ kc,
-                             const uint16_t* __restrict__ vc, const StepParams* __restrict__ p,
-                             float* __restrict__ part, int nh, int nkv, int cap, int window, int max_splits) {
+// grid (nkv, max_splits, ncols), block (nh/nkv) waves; a wave per query head of the group.  The split's K and V are
+// staged once in LDS (rows padded by 2 halves so a lane per key does not hit one bank); a lane scores its own keys,
+// then the probabilities go through LDS for the V sum (a lane per 2 dims).
+__global__ void __launch_bounds__(256) k_attn_split(const float* __restrict__ qkv, const uint16_t* __restrict__ kc,
+                                                    const uint16_t* __restrict__ vc, const StepParams* __restrict__ p,
+                                                    float* __restrict__ part, int nh, int nkv, int cap, int window,
+                                                    int max_splits) {
+    constexpr int KP = kHD + 2;  // padded row, halves
+    __shared__ uint16_t Ks[kSplit * KP];
+    __shared__ uint16_t Vs[kSplit * kHD];
+    __shared__ float P[8][kSplit];
     const int kvh = blockIdx.x, sp = blockIdx.y, c = blockIdx.z;
     const int g = nh / nkv;
     const int w = threadIdx.x / WS, lane = threadIdx.x % WS;
@@ -259,22 +266,60 @@ __global__ void k_attn_split(const float* __restrict__ qkv, const uint16_t* __re
     const int lo = window > 0 ? max(0, pos - window + 1) : 0;
     const int t0 = lo + sp * kSplit;
     if (t0 > pos) return;
-    const int t1 = min(pos + 1, t0 + kSplit);
+    const int n = min(pos + 1, t0 + kSplit) - t0;
+    // stage: 8 threads x 16 bytes per 128-byte row
+    for (int idx = threadIdx.x; idx < kSplit * 8; idx += blockDim.x) {
+        const int j = idx / 8, q8 = (idx % 8) * 8;
+        if (j < n) {
+            const size_t slot = (size_t) ((t0 + j) % cap);
+            const uint4 kv = *(const uint4*) (kc + (slot * nkv + kvh) * kHD + q8);
+            const uint4 vv = *(const uint4*) (vc + (slot * nkv + kvh) * kHD + q8);
+            uint32_t* kd = (uint32_t*) &Ks[j * KP + q8];  // 4-byte aligned (KP even)
+            kd[0] = kv.x; kd[1] = kv.y; kd[2] = kv.z; kd[3] = kv.w;
+            *(uint4*) &Vs[j * kHD + q8] = vv;
+        }
+    }
+    __syncthreads();
     const float scale = rsqrtf((float) kHD);
     const float* q = qkv + (size_t) c * (nh + 2 * nkv) * kHD + h * kHD;
-    const float q0 = q[2 * lane] * scale, q1 = q[2 * lane + 1] * scale;
-    float m = -INFINITY, l = 0.f, a0 = 0.f, a1 = 0.f;
-    for (int t = t0; t < t1; ++t) {
-        const size_t slot = (size_t) (t % cap);
-        const uint32_t kk = *(const uint32_t*) (kc + (slot * nkv + kvh) * kHD + 2 * lane);
-        const float s = warp_sum(q0 * h2f((uint16_t) (kk & 0xffff)) + q1 * h2f((uint16_t) (kk >> 16)));
-        const uint32_t vv = *(const uint32_t*) (vc + (slot * nkv + kvh) * kHD + 2 * lane);
-        const float mn = fmaxf(m, s);
-        const float sc = __expf(m - mn), pe = __expf(s - mn);
-        l = l * sc + pe;
-        a0 = a0 * sc + pe * h2f((uint16_t) (vv & 0xffff));
-        a1 = a1 * sc + pe * h2f((uint16_t) (vv >> 16));
-        m = mn;
+    float qr[kHD];
+#pragma unroll
+    for (int d = 0; d < kHD; ++d) qr[d] = q[d] * scale;
+    constexpr int PER = kSplit / WS;
+    float sc[PER];
+    float m = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int j = lane + i * WS;
+        float v = -INFINITY;
+        if (j < n) {
+            v = 0.f;
+            const uint32_t* kr = (const uint32_t*) &Ks[j * KP];
+#pragma unroll
+            for (int d2 = 0; d2 < kHD / 2; ++d2) {
+                const uint32_t kk = kr[d2];
+                v += qr[2 * d2] * h2f((uint16_t) (kk & 0xffff)) + qr[2 * d2 + 1] * h2f((uint16_t) (kk >> 16));
+            }
+        }
+        sc[i] = v;
+        m = fmaxf(m, v);
+    }
+    m = warp_max(m);
+    float l = 0.f;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const float pe = sc[i] == -INFINITY ? 0.f : __expf(sc[i] - m);
+        l += pe;
+        P[w][lane + i * WS] = pe;
+    }
+    l = warp_sum(l);
+    __syncthreads();
+    float a0 = 0.f, a1 = 0.f;
+    for (int j = 0; j < n; ++j) {
+        const float pe = P[w][j];
+        const uint32_t vv = *(const uint32_t*) &Vs[j * kHD + 2 * lane];
+        a0 += pe * h2f((uint16_t) (vv & 0xffff));
+        a1 += pe * h2f((uint16_t) (vv >> 16));
     }
     float* o = part + (((size_t) c * nh + h) * max_splits + sp) * (kHD + 2);
     if (lane == 0) { o[0] = m; o[1] = l; }

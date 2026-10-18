@@ -17,6 +17,7 @@ import codecs
 import json
 import pathlib
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -332,6 +333,7 @@ def main():
     tk = oss_tokenizer.load(a.model)
     eng = Engine(a.engine, a.model, extra)
     name = a.name or pathlib.Path(a.model).stem
+    signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(eng, tk, name, a.api_key, a.reasoning))
     print(f"strata-oss server: http://{a.host}:{a.port}/v1 ({name}, context {eng.n_ctx})", file=sys.stderr, flush=True)
     try:

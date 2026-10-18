@@ -211,3 +211,22 @@ template instances. The kernels now build without it, and greedy output with dra
 **The output-speed jump to ~104 tok/s is the profile, not the drafts**: VRAM now covers 97% of routings vs 77% on the
 first start (the profile saved by earlier runs). Adaptation itself costs nothing measurable: 105.4 / 104.8 / 105.1
 tok/s with swaps off / every 16 / every 64 steps.
+
+## 14. EAGLE3 for gpt-oss-120b: what acceptance to expect (measured with llama.cpp)
+
+`ggml-org/gpt-oss-120b-GGUF` ships `eagle3-gpt-oss-120b-Q8_0.gguf` (849 MB). llama-server (`--spec-type draft-eagle3`,
+`--spec-draft-n-max 4`, greedy, low reasoning effort), same PC:
+
+| prompt | drafts kept | tokens a step | llama.cpp output (its no-draft 50.5) |
+| --- | ---: | ---: | ---: |
+| explain-in-3-paragraphs (prose) | 286 / 849 = 34% | 2.34 | 34.9 tok/s |
+| Python date-parsing function (code) | 246 / 416 = 59% | 3.37 | 49.7 tok/s |
+
+- Acceptance is the draft model's, not the engine's, so it carries over. With strata-oss's step costs (5 tokens a step
+  ~2.05x one, plus the 1-layer draft run 4 times), projected: prose ~1.0-1.1x, code ~1.4-1.5x. In llama.cpp it is a
+  loss on this PC because its verify step is expensive (its CPU-side layers run every drafted token's experts).
+- Cost of the port: EAGLE3 is one decoder layer (input: token embedding + fc(concat of 3 target layers' hidden
+  states)), its own KV cache, a reduced-vocabulary head with a d2t map; the target must save 3 layers' hidden states
+  for each verified token.
+- Gotcha: `pkill -f <pattern>` from a shell whose own command line contains the pattern kills that shell (twice
+  here). Kill by PID.

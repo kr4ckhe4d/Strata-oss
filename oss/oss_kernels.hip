@@ -10,6 +10,8 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace oss {
 
@@ -895,6 +897,161 @@ __global__ void k_gather_rows_q8(const int8_t* __restrict__ q, const float* __re
     for (int i = threadIdx.x; i < n / 32; i += blockDim.x) od[(size_t) r * (n / 32) + i] = d[(size_t) src * (n / 32) + i];
 }
 
+// WMMA prompt attention (gfx12): a block = 64 queries (4 waves x 16) of one head; 64-key tiles of K and V^T in LDS.
+// Fragment layout (checked on gfx1201): A (16 x 16, M x K): lane l -> row l % 16, k = 8 (l / 16) + i;
+// B (K x N): lane l -> column l % 16, k = 8 (l / 16) + i; C: lane l -> column l % 16, rows 8 (l / 16) + i.
+// So a lane's 8 accumulator values share 8 query rows with the 15 other lanes of its half-wave: the row max / sum
+// reduce over those 16 lanes, and the output's per-row rescale is the lane's own.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define OSS_WMMA 1
+#endif
+typedef _Float16 h8v __attribute__((ext_vector_type(8)));
+typedef float f8v __attribute__((ext_vector_type(8)));
+constexpr int kWQ = 64, kWK = 64, kWP = 8;  // queries a block, keys a tile, LDS row padding (halves)
+__global__ void __launch_bounds__(128) k_attn_prompt_wmma(const float* __restrict__ qkv, const uint16_t* __restrict__ kc,
+                                                          const uint16_t* __restrict__ vc,
+                                                          const float* __restrict__ sinks, int pos0,
+                                                          uint16_t* __restrict__ out, int nh, int nkv, int cap,
+                                                          int window, int ntok) {
+#if defined(OSS_WMMA)
+    __shared__ _Float16 Ks[kWK][kHD + kWP];   // [key][dim]
+    __shared__ _Float16 Vt[kHD][kWK + kWP];   // [dim][key]
+    __shared__ _Float16 Ps[4][16][kWK + kWP]; // per wave: [query][key]
+    const int h = blockIdx.y, kvh = h / (nh / nkv);
+    const int wv = threadIdx.x / WS, lane = threadIdx.x % WS;
+    const int lr = lane % 16, lh = lane / 16;
+    const int q0 = blockIdx.x * kWQ + wv * 16;  // this wave's first query
+    const int stride = (nh + 2 * nkv) * kHD;
+    const float scale = rsqrtf((float) kHD);
+    // Q fragments: 4 k-steps of 16 dims
+    h8v qa[kHD / 16];
+    {
+        const int qi = min(q0 + lr, ntok - 1);
+        const float* qp = qkv + (size_t) qi * stride + h * kHD;
+#pragma unroll
+        for (int ks = 0; ks < kHD / 16; ++ks)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) qa[ks][i] = (_Float16) (qp[ks * 16 + 8 * lh + i] * scale);
+    }
+    // the 8 query rows this lane's accumulators hold
+    int qpos[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) qpos[i] = pos0 + min(q0 + 8 * lh + i, ntok - 1);
+    f8v o[kHD / 16];
+#pragma unroll
+    for (int dt = 0; dt < kHD / 16; ++dt) o[dt] = f8v{};
+    float m[8], l[8];
+    const float sink = sinks[h];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { m[i] = sink; l[i] = 1.f; }
+    const int first_q = blockIdx.x * kWQ, last_q = min(ntok, first_q + kWQ) - 1;
+    const int blo = window > 0 ? max(0, pos0 + first_q - window + 1) : 0;
+    const int bhi = pos0 + last_q;
+    const int wlo = window > 0 ? max(0, pos0 + min(q0, ntok - 1) - window + 1) : 0;
+    const int whi = pos0 + min(q0 + 15, ntok - 1);
+    for (int t0 = blo; t0 <= bhi; t0 += kWK) {
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < kWK * (kHD / 8); idx += blockDim.x) {
+            const int j = idx / (kHD / 8), d8 = (idx % (kHD / 8)) * 8;
+            const int t = t0 + j;
+            uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+            if (t <= bhi) {
+                const size_t slot = (size_t) (t % cap);
+                kv = *(const uint4*) (kc + (slot * nkv + kvh) * kHD + d8);
+                vv = *(const uint4*) (vc + (slot * nkv + kvh) * kHD + d8);
+            }
+            *(uint4*) &Ks[j][d8] = kv;
+            const _Float16* vb = (const _Float16*) &vv;
+#pragma unroll
+            for (int u = 0; u < 8; ++u) Vt[d8 + u][j] = vb[u];
+        }
+        __syncthreads();
+        if (t0 > whi || t0 + kWK - 1 < wlo) continue;  // nothing in this tile for this wave's queries
+        // S = Q K^T: 4 tiles of 16 keys
+        f8v sc[kWK / 16];
+#pragma unroll
+        for (int kt = 0; kt < kWK / 16; ++kt) {
+            f8v acc = {};
+#pragma unroll
+            for (int ks = 0; ks < kHD / 16; ++ks) {
+                const h8v kb = *(const h8v*) &Ks[kt * 16 + lr][ks * 16 + 8 * lh];
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(qa[ks], kb, acc);
+            }
+            sc[kt] = acc;
+        }
+        // mask, row max over the tile (16 lanes of the half-wave), rescale
+        float tmax[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) tmax[i] = -INFINITY;
+#pragma unroll
+        for (int kt = 0; kt < kWK / 16; ++kt) {
+            const int t = t0 + kt * 16 + lr;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int lo = window > 0 ? qpos[i] - window + 1 : 0;
+                const bool ok = t <= qpos[i] && t >= lo && t <= bhi;
+                sc[kt][i] = ok ? sc[kt][i] : -INFINITY;
+                tmax[i] = fmaxf(tmax[i], sc[kt][i]);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+#pragma unroll
+            for (int off = 8; off > 0; off >>= 1) tmax[i] = fmaxf(tmax[i], __shfl_xor(tmax[i], off, WS));
+        }
+        float alpha[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float mn = fmaxf(m[i], tmax[i]);
+            alpha[i] = __expf(m[i] - mn);
+            m[i] = mn;
+        }
+        float rs[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) rs[i] = 0.f;
+#pragma unroll
+        for (int kt = 0; kt < kWK / 16; ++kt)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float pe = sc[kt][i] == -INFINITY ? 0.f : __expf(sc[kt][i] - m[i]);
+                rs[i] += pe;
+                Ps[wv][8 * lh + i][kt * 16 + lr] = (_Float16) pe;
+            }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+#pragma unroll
+            for (int off = 8; off > 0; off >>= 1) rs[i] += __shfl_xor(rs[i], off, WS);
+            l[i] = l[i] * alpha[i] + rs[i];
+        }
+#pragma unroll
+        for (int dt = 0; dt < kHD / 16; ++dt)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) o[dt][i] *= alpha[i];
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+        // O += P V: P (16 x 64 keys) as A, V^T rows as B
+#pragma unroll
+        for (int kt = 0; kt < kWK / 16; ++kt) {
+            const h8v pa = *(const h8v*) &Ps[wv][lr][kt * 16 + 8 * lh];
+#pragma unroll
+            for (int dt = 0; dt < kHD / 16; ++dt) {
+                const h8v vb = *(const h8v*) &Vt[dt * 16 + lr][kt * 16 + 8 * lh];
+                o[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pa, vb, o[dt]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int qi = q0 + 8 * lh + i;
+        if (qi >= ntok) continue;
+        const float il = 1.f / l[i];
+#pragma unroll
+        for (int dt = 0; dt < kHD / 16; ++dt) out[(size_t) qi * nh * kHD + h * kHD + dt * 16 + lr] = f2h(o[dt][i] * il);
+    }
+#endif
+}
+
 unsigned cdiv(size_t a, size_t b) { return (unsigned) ((a + b - 1) / b); }
 
 } // namespace
@@ -1037,8 +1194,20 @@ void add_bias_residual(float* x, const float* y, const float* bias, int n, int n
 void attn_prompt(const float* qkv, const uint16_t* kc, const uint16_t* vc, const float* sinks, int pos0,
                  uint16_t* out16, int nh, int nkv, int hd, int cap, int window, int ntok, hipStream_t s) {
     (void) hd;
-    hipLaunchKernelGGL(k_attn_prompt, dim3(cdiv(ntok, kQT), nh), dim3(kQT), 0, s, qkv, kc, vc, sinks, pos0, out16, nh,
-                       nkv, cap, window, ntok);
+    static const bool wmma = [] {
+        int dev = 0;
+        hipDeviceProp_t pr;
+        (void) hipGetDevice(&dev);
+        (void) hipGetDeviceProperties(&pr, dev);
+        const char* env = std::getenv("OSS_ATTN_WMMA");
+        return (env ? std::atoi(env) != 0 : true) && std::strncmp(pr.gcnArchName, "gfx120", 6) == 0;
+    }();
+    if (wmma)
+        hipLaunchKernelGGL(k_attn_prompt_wmma, dim3(cdiv(ntok, kWQ), nh), dim3(128), 0, s, qkv, kc, vc, sinks, pos0,
+                           out16, nh, nkv, cap, window, ntok);
+    else
+        hipLaunchKernelGGL(k_attn_prompt, dim3(cdiv(ntok, kQT), nh), dim3(kQT), 0, s, qkv, kc, vc, sinks, pos0, out16,
+                           nh, nkv, cap, window, ntok);
 }
 
 void gather_rows_f16(const uint16_t* src, const int32_t* rows, uint16_t* dst, int n, int count, hipStream_t s) {

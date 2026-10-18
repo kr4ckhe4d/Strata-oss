@@ -130,3 +130,19 @@ probabilities go through LDS for the V sum.
 Also closer to llama.cpp's one-token path on 20b: KL 0.054 -> 0.029, top-1 90.5% -> 91.7%; the per-key online
 rescale was the noisier formulation (the KL 5.6 outlier at position 160 is gone).
 Prompt speed at long context is unchanged (16K 857, 32K 570 tok/s): that is `k_attn_prompt`, next.
+
+## 10. WMMA prompt attention (gfx12)
+
+- gfx12 WMMA fragment layout, verified with a 16x16 test against a CPU matmul (exact): A (M x K): lane l holds row
+  l % 16, k = 8 (l / 16) + i; B (K x N): column l % 16, k = 8 (l / 16) + i; C: column l % 16, rows 8 (l / 16) + i.
+  (gfx11's layout is different, it duplicates halves; this kernel is gfx120x only, `OSS_ATTN_WMMA=0` = the old one.)
+- The C layout makes flash attention easy: a lane's 8 accumulators are 8 query rows shared with the 15 other lanes of
+  its half-wave, so row max / sum are 16-lane reductions and the output rescale is lane-local. P goes through LDS
+  (C layout -> A layout); V is stored transposed in LDS so each B fragment is one 16-byte read.
+- The old kernel (a thread per query, 207 VGPRs, scratch spills) vs WMMA on 20b: KL 0.012 between them, perplexity
+  on a 2,000-token document 23.2 vs 23.5, top-1 45.3% both (f16 rounding of Q and P).
+
+| 120b prompt | before | WMMA |
+| --- | ---: | ---: |
+| 16K tokens | 857 tok/s | 1,549 tok/s |
+| 32K tokens | 570 tok/s | 1,412 tok/s |

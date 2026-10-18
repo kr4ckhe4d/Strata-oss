@@ -230,3 +230,36 @@ tok/s with swaps off / every 16 / every 64 steps.
   for each verified token.
 - Gotcha: `pkill -f <pattern>` from a shell whose own command line contains the pattern kills that shell (twice
   here). Kill by PID.
+
+## 15. EAGLE3 in strata-oss
+
+The draft (`--draft-model eagle3-gpt-oss-120b-Q8_0.gguf`, server `--draft-model`) runs on the last GPU after each
+verify step: the decode graph copies the residual entering target layers 24 and 30 and after layer 35 into a feature
+buffer (one strided device copy each, inside the graph), g(p) = fc(norm(features)) goes into a ring, and the draft's
+KV rows (token p + 1, g(p)) are caught up for the accepted tokens before drafting. Its RoPE is llama-style (adjacent
+pairs; base 500000, YaRN factor 32), its attention has no sinks, its MLP is a dense SwiGLU (16,384 wide).
+
+- **Reduced draft vocabulary** (`oss/draft_vocab.txt`, `oss/tools/draft_vocab.py`): the full head is 201,088 x 2,880
+  Q8_0 = 615 MB, which a draft token would read every time. 49,152 ids (the most frequent of a 4.0M-token docs + code
+  corpus, the specials, then low ids) cover 96.4% of held-out gpt-oss answers (ids < 32K alone: 81-87%; o200k's id
+  order is a poor frequency proxy). Head 141 MB. A draft token measures 0.97-1.07 ms (~0.09 of a target step).
+- **The draft model costs VRAM**: ~0.9 GB on GPU 1 = 75 fewer expert slots (3,290 -> 3,215). Greedy output with
+  EAGLE3 is token-identical to the same placement without drafts (checked on two prompts); against the run without
+  the model loaded it differs, because the GPU/CPU split of the experts changed.
+- **How many to draft.** First version: the cost model with one acceptance rate for every depth -> ~1.5 drafts a
+  step, 1.65-1.89 tokens a step, prose 120 / code 89 tok/s. A per-depth conditional rate changed little: the model
+  never tried deep drafts, so it never learned they were kept (an exploration problem). What worked: let the draft
+  stop itself when its own top probability falls below p_min (as llama.cpp's `p_min`), up to 6 drafts:
+
+| 120b, greedy, low effort, adaptation off | no drafts (no model loaded) | p_min 0.4 | **p_min 0.6 (default)** | p_min 0.8 |
+| --- | ---: | ---: | ---: | ---: |
+| prose (3 paragraphs) | 103.7 | 123.0 | **123.4 (+19%)** | 117.9 |
+| code (Python function) | 81.7 | 88.7 | **95.3 (+17%)** | 97.4 |
+| tokens a step prose / code | 1.00 | 2.12 / 2.44 | 1.79 / 2.18 | 1.50 / 1.93 |
+
+- Why more tokens a step is not always faster on code: the code prompt's single step already costs 12.2 ms vs 9.6
+  ms for prose (it routes to more experts that are on the CPU), and every extra checked token brings more CPU misses,
+  so the verify cost table measured on prose under-states code's. `OSS_DRAFT_PMIN` overrides p_min.
+- Prompt lookup still goes first when it finds a match (free drafts); the code-edit prompt stays ~98-101 tok/s.
+- Server, EAGLE3 on: a code answer at temperature 0: 98.6 tok/s, at temperature 1.0: 107.3 tok/s (sampling stays
+  exact: a draft is kept with the target's probability).

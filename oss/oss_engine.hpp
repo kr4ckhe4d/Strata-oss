@@ -24,6 +24,8 @@ struct Options {
     int adapt_every = 16;            // decode steps between adaptive swap rounds (0: off)
     int adapt_swaps = 6;             // swaps per round at most
     bool verbose = false;
+    std::string draft_model;         // an EAGLE3 GGUF (eagle3-gpt-oss-120b): speculative drafts from it
+    std::string draft_vocab;         // its reduced vocabulary (oss/draft_vocab.txt); empty: the full one
 };
 
 struct Stats {
@@ -56,6 +58,9 @@ public:
     int n_past() const;
     /// Drops the cache positions from n on (the rejected drafts of a verify window).
     void truncate(int n);
+    /// EAGLE3: up to k draft tokens to follow `pending` (the target's next token, not yet evaluated).
+    bool has_draft() const;
+    int draft(int32_t pending, int k, std::vector<int32_t>& out);
     const std::vector<int32_t>& history() const;
 
     Stats& stats();

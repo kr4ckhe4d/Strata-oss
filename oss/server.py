@@ -325,9 +325,14 @@ def main():
     ap.add_argument("--api-key")
     ap.add_argument("--name", default=None, help="model id the API reports (default: the GGUF's file name)")
     ap.add_argument("--reasoning", default="medium", choices=["low", "medium", "high"])
+    ap.add_argument("--draft-model", help="an EAGLE3 GGUF (eagle3-gpt-oss-120b-Q8_0.gguf): speculative drafts")
     a, extra = ap.parse_known_args()
     if extra and extra[0] == "--":
         extra = extra[1:]
+    if a.draft_model:
+        extra = ["--draft-model", a.draft_model] + extra
+        if "--draft-vocab" not in extra:
+            extra += ["--draft-vocab", str(here / "draft_vocab.txt")]
     if a.host not in ("127.0.0.1", "localhost", "::1") and not a.api_key:
         sys.exit("strata-oss server: refusing to listen on %s without --api-key" % a.host)
     tk = oss_tokenizer.load(a.model)

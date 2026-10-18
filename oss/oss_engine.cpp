@@ -160,8 +160,37 @@ struct HostLayer {
     int dev = 0;
 };
 
+struct Eagle {
+    bool on = false;
+    std::unique_ptr<strata::GgufModel> g;
+    int tl[3] = {};
+    int R = 0, FF = 0, NS = 0, IN = 0;  // qkv rows, ffn width, draft vocab, attention input (2H)
+    int8_t *qkv_q = nullptr, *o_q = nullptr, *gu_q = nullptr, *down_q = nullptr, *fc_q = nullptr, *head_q = nullptr;
+    uint16_t *qkv_d = nullptr, *o_d = nullptr, *gu_d = nullptr, *down_d = nullptr, *fc_d = nullptr, *head_d = nullptr;
+    float *attn_norm = nullptr, *attn_norm2 = nullptr, *ffn_norm = nullptr, *out_norm = nullptr, *enc_norm = nullptr;
+    int32_t* map_d = nullptr;
+    uint16_t *kc = nullptr, *vc = nullptr;
+    int cap = 0;
+    RopeParams rope{};
+    float eps = 1e-5f;
+    float *feat = nullptr, *pfeat = nullptr, *gring = nullptr, *gtmp = nullptr;
+    int G = 0;
+    StepParams* params = nullptr;
+    float *xe = nullptr, *gin = nullptr, *cat = nullptr, *qkv = nullptr, *ao = nullptr, *res = nullptr, *gu = nullptr,
+          *act = nullptr, *out = nullptr, *logits = nullptr;
+    int8_t *catq = nullptr, *aoq = nullptr, *hq = nullptr, *actq = nullptr, *gq = nullptr;
+    float *catd = nullptr, *aod = nullptr, *hd = nullptr, *actd = nullptr, *gqd = nullptr;
+    int32_t* tok_d = nullptr;
+    int n_valid = 0;  // draft KV rows [0, n_valid) hold (token p + 1, g(p))
+    float last_p = 0.f;  // the draft model's probability of its last pick
+    float p_min = 0.6f;  // drafting stops below this (OSS_DRAFT_PMIN)
+    double t_draft = 0;
+    uint64_t n_draft_steps = 0;
+};
+
 struct Engine::Impl {
     Options o;
+    Eagle eg;
     std::unique_ptr<strata::GgufModel> gguf;
     Hp hp;
     std::vector<std::string> vocab;
@@ -222,11 +251,15 @@ struct Engine::Impl {
     }
     // Q8_0 rows -> (int8 plane, half plane)
     void q8_planes(const std::string& name, int n_in, int n_out, std::vector<int8_t>& q, std::vector<uint16_t>& d,
-                   size_t row0) const {
-        const auto& t = tensor(name);
+                   size_t row0, const strata::GgufModel* from = nullptr) const {
+        const strata::GgufModel& gg = from ? *from : *gguf;
+        size_t shard = 0;
+        const strata::TensorInfo* tp = gg.find(name, &shard);
+        if (!tp) throw std::runtime_error("strata-oss: tensor " + name + " is missing");
+        const auto& t = *tp;
         if (t.type != kQ8_0) throw std::runtime_error("strata-oss: " + name + " is not Q8_0 (only Q8_0 dense weights)");
         if ((int) t.shape[0] != n_in || (int) t.shape[1] != n_out) throw std::runtime_error("strata-oss: " + name + " shape");
-        const uint8_t* src = tdata(name);
+        const uint8_t* src = gg.shard(shard).tensor_data(t);
         const int nb = n_in / 32;
         for (int r = 0; r < n_out; ++r)
             for (int b = 0; b < nb; ++b) {
@@ -677,6 +710,269 @@ struct Engine::Impl {
         HIPCHECK(hipHostMalloc((void**) &wptr_h, sizeof(void*) * hp.E, hipHostMallocPortable));
     }
 
+
+    // ---------------------------------------------------------------- EAGLE3 draft
+    void load_eagle() {
+        Eagle& e = eg;
+        e.g.reset(new strata::GgufModel(strata::GgufModel::open(o.draft_model)));
+        const strata::GgufFile& m = e.g->meta();
+        const strata::MetaValue* arch = m.get("general.architecture");
+        if (!arch || arch->s != "eagle3") throw std::runtime_error("strata-oss: " + o.draft_model + " is not an EAGLE3 GGUF");
+        auto num = [&](const char* k, double def) {
+            const strata::MetaValue* v = m.get(std::string("eagle3.") + k);
+            return v ? v->num() : def;
+        };
+        const strata::MetaValue* tls = m.get("eagle3.target_layers");
+        if (!tls || tls->items.size() != 3) throw std::runtime_error("strata-oss: EAGLE3 needs 3 target layers");
+        for (int k = 0; k < 3; ++k) e.tl[k] = (int) tls->items[k].num();
+        Dev& d = devs.back();
+        for (int k = 0; k < 3; ++k)
+            if (e.tl[k] < d.l0) {
+                std::fprintf(stderr, "strata-oss: EAGLE3 reads layer %d, which is not on the last GPU (layers %d-%d): "
+                             "no drafts from it\n", e.tl[k], d.l0, d.l1 - 1);
+                e.g.reset();
+                return;
+            }
+        const int H = hp.H;
+        if ((int) num("embedding_length", 0) != H || (int) num("target_hidden_size", 0) != H ||
+            (int) num("attention.head_count", 0) != hp.NH || (int) num("attention.head_count_kv", 0) != hp.NKV ||
+            (int) num("attention.key_length", 0) != hp.HD)
+            throw std::runtime_error("strata-oss: the EAGLE3 model's shape does not match the target");
+        e.FF = (int) num("feed_forward_length", 0);
+        e.eps = (float) num("attention.layer_norm_rms_epsilon", 1e-5);
+        e.IN = 2 * H;
+        e.R = (hp.NH + 2 * hp.NKV) * hp.HD;
+        const float base = (float) num("rope.freq_base", 10000), factor = (float) num("rope.scaling.factor", 1);
+        const int n_orig = (int) num("rope.scaling.original_context_length", 4096);
+        const float bf = (float) num("rope.scaling.yarn_beta_fast", 32), bs = (float) num("rope.scaling.yarn_beta_slow", 1);
+        e.rope.freq_base = base;
+        e.rope.freq_scale = 1.f / factor;
+        e.rope.ext_factor = factor > 1.f ? 1.f : 0.f;
+        e.rope.attn_factor = 1.f;
+        e.rope.n_dims = hp.HD;
+        e.rope.neox = 0;  // llama.cpp: LLAMA_ROPE_TYPE_NORM for eagle3
+        auto corr_dim = [&](float n_rot) {
+            return hp.HD * std::log((float) n_orig / (n_rot * 2 * (float) M_PI)) / (2 * std::log(base));
+        };
+        e.rope.corr0 = std::max(0.f, std::floor(corr_dim(bf)));
+        e.rope.corr1 = std::min((float) (hp.HD - 1), std::ceil(corr_dim(bs)));
+        HIPCHECK(hipSetDevice(d.id));
+        auto up8 = [&](const std::string& n, int n_in, int n_out, int8_t*& q, uint16_t*& dd, std::vector<int8_t>* hq = nullptr,
+                       std::vector<uint16_t>* hd = nullptr) {
+            std::vector<int8_t> qv((size_t) n_in * n_out);
+            std::vector<uint16_t> dv((size_t) n_out * (n_in / 32));
+            q8_planes(n, n_in, n_out, qv, dv, 0, e.g.get());
+            if (hq) { *hq = std::move(qv); *hd = std::move(dv); return; }
+            q = dupload(qv.data(), qv.size());
+            dd = dupload(dv.data(), dv.size());
+        };
+        auto upf = [&](const std::string& n) {
+            size_t shard = 0;
+            const strata::TensorInfo* t = e.g->find(n, &shard);
+            if (!t || t->type != kF32) throw std::runtime_error("strata-oss: EAGLE3 " + n + " missing or not F32");
+            return dupload((const float*) e.g->shard(shard).tensor_data(*t), (size_t) t->elements());
+        };
+        {   // q, k, v as one matrix over the 2H input
+            std::vector<int8_t> q((size_t) e.R * e.IN);
+            std::vector<uint16_t> dd((size_t) e.R * (e.IN / 32));
+            const int NA = hp.NH * hp.HD, NK = hp.NKV * hp.HD;
+            q8_planes("blk.0.attn_q.weight", e.IN, NA, q, dd, 0, e.g.get());
+            q8_planes("blk.0.attn_k.weight", e.IN, NK, q, dd, NA, e.g.get());
+            q8_planes("blk.0.attn_v.weight", e.IN, NK, q, dd, NA + NK, e.g.get());
+            e.qkv_q = dupload(q.data(), q.size());
+            e.qkv_d = dupload(dd.data(), dd.size());
+        }
+        up8("blk.0.attn_output.weight", hp.NH * hp.HD, H, e.o_q, e.o_d);
+        {   // gate and up as one matrix
+            std::vector<int8_t> q((size_t) 2 * e.FF * H);
+            std::vector<uint16_t> dd((size_t) 2 * e.FF * (H / 32));
+            q8_planes("blk.0.ffn_gate.weight", H, e.FF, q, dd, 0, e.g.get());
+            q8_planes("blk.0.ffn_up.weight", H, e.FF, q, dd, e.FF, e.g.get());
+            e.gu_q = dupload(q.data(), q.size());
+            e.gu_d = dupload(dd.data(), dd.size());
+        }
+        up8("blk.0.ffn_down.weight", e.FF, H, e.down_q, e.down_d);
+        up8("fc.weight", 3 * H, H, e.fc_q, e.fc_d);
+        e.attn_norm = upf("blk.0.attn_norm.weight");
+        e.attn_norm2 = upf("blk.0.attn_norm_2.weight");
+        e.ffn_norm = upf("blk.0.ffn_norm.weight");
+        e.out_norm = upf("output_norm.weight");
+        e.enc_norm = upf("enc.output_norm.weight");
+        {   // the head, cut down to the draft vocabulary
+            std::vector<int32_t> ids;
+            if (!o.draft_vocab.empty()) {
+                FILE* f = std::fopen(o.draft_vocab.c_str(), "r");
+                if (!f) throw std::runtime_error("strata-oss: cannot read " + o.draft_vocab);
+                int x;
+                while (std::fscanf(f, "%d", &x) == 1)
+                    if (x >= 0 && x < hp.V) ids.push_back(x);
+                std::fclose(f);
+            }
+            if (ids.empty())
+                for (int i = 0; i < hp.V; ++i) ids.push_back(i);
+            std::vector<int8_t> full;
+            std::vector<uint16_t> fulld;
+            up8("output.weight", H, hp.V, e.head_q, e.head_d, &full, &fulld);
+            e.NS = (int) ids.size();
+            std::vector<int8_t> q((size_t) e.NS * H);
+            std::vector<uint16_t> dd((size_t) e.NS * (H / 32));
+            for (int r = 0; r < e.NS; ++r) {
+                std::memcpy(&q[(size_t) r * H], &full[(size_t) ids[r] * H], H);
+                std::memcpy(&dd[(size_t) r * (H / 32)], &fulld[(size_t) ids[r] * (H / 32)], 2 * (H / 32));
+            }
+            e.head_q = dupload(q.data(), q.size());
+            e.head_d = dupload(dd.data(), dd.size());
+            e.map_d = dupload(ids.data(), ids.size());
+        }
+        e.cap = o.ctx;
+        e.kc = dalloc<uint16_t>((size_t) e.cap * hp.NKV * hp.HD);
+        e.vc = dalloc<uint16_t>((size_t) e.cap * hp.NKV * hp.HD);
+        const int MC = kMaxCols;
+        e.feat = dalloc<float>((size_t) MC * 3 * H);
+        e.pfeat = dalloc<float>((size_t) o.chunk * 3 * H);
+        e.G = o.chunk + 64;
+        e.gring = dalloc<float>((size_t) e.G * H);
+        e.gtmp = dalloc<float>((size_t) MC * H);
+        e.params = dalloc<StepParams>(1);
+        e.xe = dalloc<float>((size_t) (o.chunk + MC) * H);
+        e.gin = dalloc<float>((size_t) MC * H);
+        e.cat = dalloc<float>((size_t) MC * e.IN);
+        e.qkv = dalloc<float>((size_t) MC * e.R);
+        e.ao = dalloc<float>((size_t) MC * hp.NH * hp.HD);
+        e.res = dalloc<float>((size_t) MC * H);
+        e.gu = dalloc<float>((size_t) MC * 2 * e.FF);
+        e.act = dalloc<float>((size_t) MC * e.FF);
+        e.out = dalloc<float>((size_t) MC * H);
+        e.logits = dalloc<float>((size_t) e.NS);
+        e.catq = dalloc<int8_t>((size_t) MC * e.IN);
+        e.catd = dalloc<float>((size_t) MC * e.IN / 32);
+        e.aoq = dalloc<int8_t>((size_t) MC * hp.NH * hp.HD);
+        e.aod = dalloc<float>((size_t) MC * hp.NH * hp.HD / 32);
+        e.hq = dalloc<int8_t>((size_t) MC * H);
+        e.hd = dalloc<float>((size_t) MC * H / 32);
+        e.actq = dalloc<int8_t>((size_t) MC * e.FF);
+        e.actd = dalloc<float>((size_t) MC * e.FF / 32);
+        e.gq = dalloc<int8_t>((size_t) MC * 3 * H);
+        e.gqd = dalloc<float>((size_t) MC * 3 * H / 32);
+        e.tok_d = dalloc<int32_t>(2);
+        if (const char* v = std::getenv("OSS_DRAFT_PMIN")) e.p_min = (float) std::atof(v);
+        e.on = true;
+        std::fprintf(stderr, "strata-oss: EAGLE3 draft %s on GPU %d (target layers %d, %d, %d; draft vocabulary %d)\n",
+                     o.draft_model.c_str(), d.id, e.tl[0], e.tl[1], e.tl[2], e.NS);
+    }
+
+    // g(p) = fc(norm(features(p))) for n rows of `feat` (3H floats each), positions pos0.. -> the ring
+    void eagle_g(const float* feat, int n, int pos0) {
+        Eagle& e = eg;
+        Dev& d = devs.back();
+        const int H = hp.H;
+        for (int r = 0; r < n; r += kMaxCols) {
+            const int nc = std::min(kMaxCols, n - r);
+            rmsnorm_quant(feat + (size_t) r * 3 * H, e.enc_norm, nullptr, e.gq, e.gqd, 3 * H, nc, e.eps, d.s);
+            mv_q8_0(e.fc_q, e.fc_d, e.gq, e.gqd, nullptr, e.gtmp, 3 * H, H, nc, false, d.s);
+            for (int j = 0; j < nc; ++j)
+                HIPCHECK(hipMemcpyAsync(e.gring + (size_t) ((pos0 + r + j) % e.G) * H, e.gtmp + (size_t) j * H,
+                                        sizeof(float) * H, hipMemcpyDeviceToDevice, d.s));
+        }
+    }
+
+    // the draft decoder over nc rows: embeddings xe (device, nc x H), g inputs (device pointers), positions pos0..
+    // Returns the argmax (target id) of the last row when want, else -1.  e.out holds the rows' prenorm states.
+    int eagle_rows(const float* xe, const float* const* gsrc, int pos0, int nc, bool want) {
+        Eagle& e = eg;
+        Dev& d = devs.back();
+        const int H = hp.H, NA = hp.NH * hp.HD;
+        hipStream_t s = d.s;
+        StepParams sp;
+        sp.ncols = nc;
+        for (int c = 0; c < nc; ++c) sp.pos[c] = pos0 + c;
+        HIPCHECK(hipMemcpyAsync(e.params, &sp, sizeof(sp), hipMemcpyHostToDevice, s));
+        for (int c = 0; c < nc; ++c)
+            HIPCHECK(hipMemcpyAsync(e.gin + (size_t) c * H, gsrc[c], sizeof(float) * H, hipMemcpyDeviceToDevice, s));
+        rmsnorm_strided(xe, H, e.attn_norm, e.cat, e.IN, H, nc, e.eps, s);
+        rmsnorm_strided(e.gin, H, e.attn_norm2, e.cat + H, e.IN, H, nc, e.eps, s);
+        quant_q8(e.cat, e.catq, e.catd, e.IN, nc, s);
+        mv_q8_0(e.qkv_q, e.qkv_d, e.catq, e.catd, nullptr, e.qkv, e.IN, e.R, nc, false, s);
+        rope_store(e.qkv, e.kc, e.vc, e.params, hp.NH, hp.NKV, hp.HD, e.cap, e.rope, nc, s);
+        attn_decode(e.qkv, e.kc, e.vc, nullptr, e.params, d.attn_part, e.ao, hp.NH, hp.NKV, hp.HD, e.cap, 0, o.ctx, nc,
+                    s);
+        quant_q8(e.ao, e.aoq, e.aod, NA, nc, s);
+        HIPCHECK(hipMemcpyAsync(e.res, e.gin, sizeof(float) * nc * H, hipMemcpyDeviceToDevice, s));
+        mv_q8_0(e.o_q, e.o_d, e.aoq, e.aod, nullptr, e.res, NA, H, nc, true, s);  // ffn_inp = attn + g
+        rmsnorm_quant(e.res, e.ffn_norm, nullptr, e.hq, e.hd, H, nc, e.eps, s);
+        mv_q8_0(e.gu_q, e.gu_d, e.hq, e.hd, nullptr, e.gu, H, 2 * e.FF, nc, false, s);
+        silu_mul(e.gu, e.act, e.FF, nc, s);
+        quant_q8(e.act, e.actq, e.actd, e.FF, nc, s);
+        HIPCHECK(hipMemcpyAsync(e.out, e.res, sizeof(float) * nc * H, hipMemcpyDeviceToDevice, s));
+        mv_q8_0(e.down_q, e.down_d, e.actq, e.actd, nullptr, e.out, e.FF, H, nc, true, s);  // prenorm = ffn + ffn_inp
+        if (!want) return -1;
+        rmsnorm_quant(e.out + (size_t) (nc - 1) * H, e.out_norm, nullptr, e.hq, e.hd, H, 1, e.eps, s);
+        mv_q8_0(e.head_q, e.head_d, e.hq, e.hd, nullptr, e.logits, H, e.NS, 1, false, s);
+        argmax_map(e.logits, e.NS, e.map_d, e.tok_d, s);
+        int32_t t[2] = {-1, 0};
+        HIPCHECK(hipMemcpyAsync(t, e.tok_d, sizeof(t), hipMemcpyDeviceToHost, s));
+        HIPCHECK(hipStreamSynchronize(s));
+        std::memcpy(&e.last_p, &t[1], 4);
+        return t[0];
+    }
+
+    // rows (hist[p + 1], g(p)) for p in [n_valid, npast - 2]
+    void eagle_catchup() {
+        Eagle& e = eg;
+        if (!e.on) return;
+        const int H = hp.H;
+        const int p0 = e.n_valid, p1 = npast - 1;  // exclusive end
+        if (p1 <= p0) return;
+        Dev& d = devs.back();
+        HIPCHECK(hipSetDevice(d.id));
+        std::vector<float> emb((size_t) (p1 - p0) * H);
+        embed(hist.data() + p0 + 1, p1 - p0, emb.data());
+        for (int r = 0; r < p1 - p0; r += o.chunk) {
+            const int n = std::min(o.chunk, p1 - p0 - r);
+            HIPCHECK(hipMemcpyAsync(e.xe, emb.data() + (size_t) r * H, sizeof(float) * n * H, hipMemcpyHostToDevice, d.s));
+            for (int c = 0; c < n; c += kMaxCols) {
+                const int nc = std::min(kMaxCols, n - c);
+                const float* gs[kMaxCols];
+                for (int j = 0; j < nc; ++j) gs[j] = e.gring + (size_t) ((p0 + r + c + j) % e.G) * H;
+                eagle_rows(e.xe + (size_t) c * H, gs, p0 + r + c, nc, false);
+            }
+            HIPCHECK(hipStreamSynchronize(d.s));
+        }
+        e.n_valid = p1;
+    }
+
+    int draft(int32_t pending, int k, std::vector<int32_t>& out) {
+        out.clear();
+        Eagle& e = eg;
+        if (!e.on || k <= 0 || npast < 1) return 0;
+        const auto t0 = Clock::now();
+        const int H = hp.H;
+        Dev& d = devs.back();
+        HIPCHECK(hipSetDevice(d.id));
+        eagle_catchup();
+        // the first row is a real one: (pending, g(npast - 1)); the next ones feed the draft's own prenorm state
+        int32_t tok = pending;
+        const float* g = e.gring + (size_t) ((npast - 1) % e.G) * H;
+        for (int i = 0; i < k; ++i) {
+            const int pos = npast - 1 + i;
+            if (pos + 1 >= e.cap) break;
+            std::vector<float> emb(H);
+            embed(&tok, 1, emb.data());
+            HIPCHECK(hipMemcpyAsync(e.xe, emb.data(), sizeof(float) * H, hipMemcpyHostToDevice, d.s));
+            const float* gs[1] = {g};
+            tok = eagle_rows(e.xe, gs, pos, 1, true);
+            ++e.n_draft_steps;
+            if (i == 0) e.n_valid = npast;
+            if (e.last_p < e.p_min) break;  // not confident: checking it would likely be wasted
+            out.push_back(tok);
+            // the next row's g is this row's prenorm state: copy it aside (e.out is rewritten by the next row)
+            HIPCHECK(hipMemcpyAsync(e.gtmp, e.out, sizeof(float) * H, hipMemcpyDeviceToDevice, d.s));
+            g = e.gtmp;
+        }
+        e.t_draft += secs(t0, Clock::now());
+        return (int) out.size();
+    }
+
     // ---------------------------------------------------------------- decode step
     void capture(Dev& d, int di, int nc) {
         HIPCHECK(hipSetDevice(d.id));
@@ -687,8 +983,16 @@ struct Engine::Impl {
         HIPCHECK(hipMemcpyAsync(d.params, params_h, sizeof(StepParams), hipMemcpyHostToDevice, s));
         if (first) HIPCHECK(hipMemcpyAsync(d.x, emb_h, sizeof(float) * nc * H, hipMemcpyHostToDevice, s));
         else handoff_recv(&ho[di - 1], d.params, d.x, H, nc, s);
+        auto take = [&](int l) {  // EAGLE3: the residual entering layer l (l == L: after the last layer)
+            if (!last || !eg.on) return;
+            for (int k = 0; k < 3; ++k)
+                if (eg.tl[k] == l || (l == hp.L && eg.tl[k] >= hp.L))
+                    HIPCHECK(hipMemcpy2DAsync(eg.feat + (size_t) k * H, sizeof(float) * 3 * H, d.x, sizeof(float) * H,
+                                              sizeof(float) * H, nc, hipMemcpyDeviceToDevice, s));
+        };
         for (int l = d.l0; l < d.l1; ++l) {
             DevLayer& L = d.layers[l - d.l0];
+            take(l);
             rmsnorm_quant(d.x, L.attn_norm, nullptr, d.xq, d.xd, H, nc, hp.eps, s);
             mv_q8_0(L.qkv_q, L.qkv_d, d.xq, d.xd, L.qkv_b, d.qkv, H, R, nc, false, s);
             rope_store(d.qkv, L.kc, L.vc, d.params, hp.NH, hp.NKV, hp.HD, L.cap, hp.rope, nc, s);
@@ -710,6 +1014,7 @@ struct Engine::Impl {
             wait_ack(&mb[l], d.params, s);
             moe_residual(d.x, d.y, &mb[l], H, nc, s);
         }
+        take(hp.L);
         if (!last) {
             handoff_send(&ho[di], d.params, d.x, H, nc, s);
         } else {
@@ -776,6 +1081,10 @@ struct Engine::Impl {
         for (auto& d : devs) {
             HIPCHECK(hipSetDevice(d.id));
             while (hipEventQuery(d.done) == hipErrorNotReady) cpu_relax();
+        }
+        if (eg.on) {
+            HIPCHECK(hipSetDevice(devs.back().id));
+            eagle_g(eg.feat, nc, npast);
         }
         npast += nc;
         if (o.adapt_every > 0 && ++steps_since_adapt >= o.adapt_every) {
@@ -994,7 +1303,19 @@ struct Engine::Impl {
             if (di > 0) {
                 HIPCHECK(hipMemcpyAsync(d.px, prompt_h, sizeof(float) * ntok * H, hipMemcpyHostToDevice, d.s));
             }
-            for (int l = d.l0; l < d.l1; ++l) prompt_layer(d, l, ntok, npast);
+            const bool lastd = di + 1 == devs.size();
+            auto take = [&](int l) {
+                if (!lastd || !eg.on) return;
+                for (int k = 0; k < 3; ++k)
+                    if (eg.tl[k] == l || (l == hp.L && eg.tl[k] >= hp.L))
+                        HIPCHECK(hipMemcpy2DAsync(eg.pfeat + (size_t) k * H, sizeof(float) * 3 * H, d.px,
+                                                  sizeof(float) * H, sizeof(float) * H, ntok, hipMemcpyDeviceToDevice, d.s));
+            };
+            for (int l = d.l0; l < d.l1; ++l) {
+                take(l);
+                prompt_layer(d, l, ntok, npast);
+            }
+            take(hp.L);
             if (di + 1 < devs.size()) {
                 HIPCHECK(hipMemcpyAsync(prompt_h, d.px, sizeof(float) * ntok * H, hipMemcpyDeviceToHost, d.s));
                 HIPCHECK(hipStreamSynchronize(d.s));
@@ -1011,6 +1332,7 @@ struct Engine::Impl {
             HIPCHECK(hipStreamSynchronize(d.s));
             if (want_all) all_logits.insert(all_logits.end(), logits_h, logits_h + (size_t) nc * hp.V);
         }
+        if (eg.on) eagle_g(eg.pfeat, ntok, npast);
         npast += ntok;
     }
 
@@ -1026,15 +1348,17 @@ struct Engine::Impl {
             const int n = (int) std::min(toks.size() - i, (size_t) (prompt ? o.chunk : max_cols));
             if (n > kMaxCols) {
                 prompt_chunk(toks.data() + i, n, want_all);
+                hist.insert(hist.end(), toks.begin() + i, toks.begin() + i + n);
+                eagle_catchup();  // before the next chunk reuses the g ring
                 last = logits_h;
             } else {
                 last = step(toks.data() + i, n);
+                hist.insert(hist.end(), toks.begin() + i, toks.begin() + i + n);
                 if (want_all) all_logits.insert(all_logits.end(), last, last + (size_t) n * hp.V);
                 last += (size_t) (n - 1) * hp.V;
             }
             i += n;
         }
-        hist.insert(hist.end(), toks.begin(), toks.end());
         const double dt = secs(t0, Clock::now());
         if (prompt) { st.t_prompt += dt; st.n_prompt += toks.size(); }
         else { st.t_decode += dt; st.n_decode += toks.size(); }
@@ -1053,6 +1377,7 @@ struct Engine::Impl {
                 if (L.window && n > 0 && (int64_t) n - L.window + L.cap < (int64_t) npast) n = 0;
         hist.resize(n);
         npast = (int) n;
+        eg.n_valid = std::min(eg.n_valid, std::max(0, (int) n - 1));
         return (int) n;
     }
 
@@ -1084,6 +1409,7 @@ Engine::Engine(const Options& o) : p_(new Impl) {
     m.choose_devices();
     for (size_t i = 0; i < m.devs.size(); ++i) m.alloc_device(m.devs[i], i + 1 == m.devs.size());
     m.alloc_host();
+    if (!o.draft_model.empty()) m.load_eagle();
     m.place_and_load();
     int nt = o.threads;
     if (nt <= 0) nt = std::max(1u, std::thread::hardware_concurrency() / 2);
@@ -1108,8 +1434,11 @@ void Engine::truncate(int n) {
     if (n < p_->npast) {
         p_->npast = n;
         p_->hist.resize(n);
+        p_->eg.n_valid = std::min(p_->eg.n_valid, std::max(0, n - 1));
     }
 }
+bool Engine::has_draft() const { return p_->eg.on; }
+int Engine::draft(int32_t pending, int k, std::vector<int32_t>& out) { return p_->draft(pending, k, out); }
 const std::vector<int32_t>& Engine::history() const { return p_->hist; }
 Stats& Engine::stats() { return p_->st; }
 void Engine::save_profile() { p_->save_profile(); }
@@ -1124,6 +1453,10 @@ void Engine::report(FILE* f) const {
                  (unsigned long long) s.n_decode, s.t_decode, s.t_decode > 0 ? s.n_decode / s.t_decode : 0.0,
                  s.routed ? 100.0 * s.gpu_hits / s.routed : 0.0,
                  s.prompt_routed ? 100.0 * s.prompt_hits / s.prompt_routed : 0.0, (unsigned long long) s.swaps);
+    if (p_->eg.on && p_->eg.n_draft_steps)
+        std::fprintf(f, "strata-oss: EAGLE3 %llu draft tokens in %.2f s (%.2f ms each, incl. catch-up rows)\n",
+                     (unsigned long long) p_->eg.n_draft_steps, p_->eg.t_draft,
+                     1e3 * p_->eg.t_draft / p_->eg.n_draft_steps);
 }
 
 } // namespace oss

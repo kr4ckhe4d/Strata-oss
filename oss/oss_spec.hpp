@@ -113,7 +113,7 @@ struct LookupDrafter {
 };
 
 struct SpecStats {
-    uint64_t steps = 0, drafted = 0, accepted = 0, emitted = 0;
+    uint64_t steps = 0, drafted = 0, accepted = 0, emitted = 0, eagle_drafted = 0, eagle_kept = 0;
 };
 
 /// Generates with optional speculation.  `cost[k]` = the cost of a step checking k + 1 tokens, in single steps.
@@ -124,6 +124,8 @@ public:
     int max_draft = 7;
     double cost[8] = {1.0, 1.29, 1.54, 1.79, 2.05, 2.29, 2.55, 2.87};  // 120b, measured (FINDINGS.md section 13)
     SpecStats st;
+    int eagle_max = 6;         // EAGLE3 drafts a step at most (it stops earlier on its own confidence)
+    double draft_cost = 0.09;  // one EAGLE3 draft token, in target steps: 1.07 ms vs ~12 ms (FINDINGS.md section 15)
 
     /// Starts an answer: `last` = the logits after the prompt.
     void begin(const float* last) {
@@ -138,16 +140,20 @@ public:
         const int32_t t = pending_;
         out.push_back(t);
         if (std::find(stop.begin(), stop.end(), t) != stop.end()) return out;
-        // drafts for what follows t
+        // drafts for what follows t: prompt lookup first (free), else the EAGLE3 draft model
         std::vector<int32_t> h = eng_.history();
         h.push_back(t);
         std::vector<int32_t> d;
-        int k = 0;
+        src_ = 0;
         if (spec) {
-            const int room = eng_.n_ctx() - eng_.n_past() - 2;
-            k = choose_k();
-            k = std::min(k, std::max(0, room));
-            if (k > 0) lookup_.draft(h, k, d);
+            const int room = std::max(0, eng_.n_ctx() - eng_.n_past() - 2);
+            const int kl = std::min(choose_k(0, 0.0), room);
+            if (kl > 0) lookup_.draft(h, kl, d);
+            if (d.empty() && eng_.has_draft()) {
+                // the draft model stops itself when it is not confident; the cost model only caps the length
+                const int ke = std::min(std::max(choose_k(1, draft_cost), eagle_max), room);
+                if (ke > 0) { eng_.draft(t, ke, d); src_ = 1; }
+            }
         }
         std::vector<int32_t> win{t};
         win.insert(win.end(), d.begin(), d.end());
@@ -166,7 +172,7 @@ public:
                 // a kept stop token ends the answer: evaluate nothing more
                 eng_.truncate(base + 1 + (int) j);
                 st.accepted += j + 1;
-                update(d.size(), j + 1);
+                update(src_, d.size(), j + 1);
                 st.emitted += out.size();
                 pending_ = -1;
                 return out;
@@ -174,7 +180,7 @@ public:
         }
         if (j == d.size()) next_tok = smp_.pick(lg + j * (size_t) V, V);
         st.accepted += j;
-        if (!d.empty()) update(d.size(), j);
+        if (!d.empty()) update(src_, d.size(), j);
         eng_.truncate(base + 1 + (int) j);
         pending_ = next_tok;
         st.emitted += out.size();
@@ -182,30 +188,41 @@ public:
     }
 
 private:
-    int choose_k() const {
-        // expected tokens per step with k drafts, each kept with probability a (given the previous ones were)
+    // The draft length with the most expected tokens per unit of cost.  Acceptance is tracked per depth as a
+    // conditional rate (the i-th draft kept given the ones before it were): drafts come in runs, so a deeper draft
+    // is often more likely kept than the first.  `per_draft`: the cost of making one draft, in target steps.
+    int choose_k(int src, double per_draft) const {
         double best = 1.0 / cost[0];
         int bk = 0;
+        double e = 1, p = 1;
         for (int k = 1; k <= std::min(max_draft, 7); ++k) {
-            double e = 1, p = 1;
-            for (int i = 0; i < k; ++i) { p *= alpha_; e += p; }
-            const double v = e / cost[k];
+            p *= cond(src, k - 1);
+            e += p;
+            const double v = e / (cost[k] + per_draft * k);
             if (v > best * 1.02) { best = v; bk = k; }
         }
         // probe now and then so a drafter that stopped paying can come back
         if (bk == 0 && (st.steps % 16) == 0) bk = 2;
         return bk;
     }
-    void update(size_t drafted, size_t kept) {
-        // acceptance per draft position, a running average
-        const double a = drafted ? (double) kept / (double) drafted : 0;
-        alpha_ = 0.85 * alpha_ + 0.15 * std::min(0.98, a + (kept == drafted ? 0.1 : 0.0));
+    double cond(int src, int i) const {
+        // a prior of 0.6 worth 2 trials, so an untried depth is neither ruled out nor trusted
+        return (kept_[src][i] + 1.2) / (tried_[src][i] + 2.0);
+    }
+    void update(int src, size_t drafted, size_t kept) {
+        // depth i was tried when the drafts before it were kept
+        for (size_t i = 0; i < drafted && i <= kept; ++i) {
+            tried_[src][i] = 0.98 * tried_[src][i] + 1.0;
+            kept_[src][i] = 0.98 * kept_[src][i] + (i < kept ? 1.0 : 0.0);
+        }
+        if (src == 1) { st.eagle_drafted += drafted; st.eagle_kept += kept; }
     }
     Engine& eng_;
     Sampler& smp_;
     LookupDrafter lookup_;
     int32_t pending_ = -1;
-    double alpha_ = 0.5;
+    double kept_[2][8] = {}, tried_[2][8] = {};
+    int src_ = 0;
 };
 
 } // namespace oss

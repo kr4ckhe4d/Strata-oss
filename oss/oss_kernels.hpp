@@ -55,6 +55,7 @@ struct Handoff {
 struct RopeParams {
     float freq_base, freq_scale, ext_factor, attn_factor, corr0, corr1;
     int n_dims;
+    int neox = 1;  // 1: pairs (i, i + n_dims / 2) as gpt-oss; 0: pairs (2i, 2i + 1) as llama (the EAGLE3 draft)
 };
 
 // ---- elementwise / norms
@@ -128,5 +129,14 @@ void mmq_down(const uint8_t* const* wptr, const int32_t* tiles, int tile0, int n
               const float* ad, float* y, int n_embd, int n_ff, hipStream_t s);
 void gather_rows_q8(const int8_t* q, const float* d, const int32_t* rows, int8_t* oq, float* od, int n, int count,
                     hipStream_t s);
+
+// ---- the EAGLE3 draft (decode-style, 1..8 rows)
+// y[c][0..n) at row stride ldy = x[c] (row stride ldx) / rms * w
+void rmsnorm_strided(const float* x, int ldx, const float* w, float* y, int ldy, int n, int ncols, float eps,
+                     hipStream_t s);
+// act[c][i] = silu(gu[c][i]) * gu[c][n + i]
+void silu_mul(const float* gu, float* act, int n, int ncols, hipStream_t s);
+// out[0] = map[argmax(logits[0..n))], out[1] = its softmax probability (float bits)
+void argmax_map(const float* logits, int n, const int32_t* map, int32_t* out, hipStream_t s);
 
 } // namespace oss

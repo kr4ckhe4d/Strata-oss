@@ -204,6 +204,8 @@ int main(int argc, char** argv) {
         else if (a == "--serve") mode = "serve";
         else if (a == "--bench-verify") mode = "verify";
         else if (a == "--no-spec") spec = false;
+        else if (a == "--draft-model") o.draft_model = next();
+        else if (a == "--draft-vocab") o.draft_vocab = next();
         else if (a == "--draft-max") draft_max = std::atoi(next().c_str());
         else if (a == "-v") o.verbose = true;
         else { usage(); return 2; }
@@ -273,10 +275,11 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 if (end) break;
             }
-            std::fprintf(stderr, "strata-oss: %llu steps, %llu drafted, %llu kept (%.2f tokens a step)\n",
+            std::fprintf(stderr, "strata-oss: %llu steps, %llu drafted, %llu kept (%.2f tokens a step; EAGLE3 %llu / %llu)\n",
                          (unsigned long long) gen.st.steps, (unsigned long long) gen.st.drafted,
                          (unsigned long long) gen.st.accepted,
-                         gen.st.steps ? (double) gen.st.emitted / gen.st.steps : 0.0);
+                         gen.st.steps ? (double) gen.st.emitted / gen.st.steps : 0.0,
+                         (unsigned long long) gen.st.eagle_kept, (unsigned long long) gen.st.eagle_drafted);
             const auto t2 = std::chrono::steady_clock::now();
             std::printf("\n");
             const double tp = std::chrono::duration<double>(t1 - t0).count();

@@ -226,22 +226,23 @@ __global__ void k_rope_store(float* __restrict__ qkv, uint16_t* __restrict__ kc,
     float* row = qkv + (size_t) c * stride;
     float* v = row + head * hd;  // q heads, then k heads
     const int half = hd / 2;
+    const int j0 = rp.neox ? i : 2 * i, j1 = rp.neox ? i + half : 2 * i + 1;
     float cs, sn;
     yarn_cs((float) pos, 2 * i, rp, cs, sn);
-    const float x0 = v[i], x1 = v[i + half];
+    const float x0 = v[j0], x1 = v[j1];
     const float r0 = x0 * cs - x1 * sn, r1 = x0 * sn + x1 * cs;
-    v[i] = r0;
-    v[i + half] = r1;
+    v[j0] = r0;
+    v[j1] = r1;
     if (head >= nh) {
         const int kh = head - nh;
         const size_t slot = (size_t) (pos % cap);
         uint16_t* kd = kc + (slot * nkv + kh) * hd;
-        kd[i] = f2h(r0);
-        kd[i + half] = f2h(r1);
+        kd[j0] = f2h(r0);
+        kd[j1] = f2h(r1);
         const float* vs = row + (nh + nkv) * hd + kh * hd;
         uint16_t* vd = vc + (slot * nkv + kh) * hd;
-        vd[i] = f2h(vs[i]);
-        vd[i + half] = f2h(vs[i + half]);
+        vd[j0] = f2h(vs[j0]);
+        vd[j1] = f2h(vs[j1]);
     }
 }
 
@@ -338,10 +339,10 @@ __global__ void k_attn_combine(const float* __restrict__ part, const float* __re
     const int lo = window > 0 ? max(0, pos - window + 1) : 0;
     const int ns = (pos - lo + 1 + kSplit - 1) / kSplit;
     const float* base = part + ((size_t) c * nh + h) * max_splits * (kHD + 2);
-    const float sink = sinks[h];
+    const float sink = sinks ? sinks[h] : -INFINITY;  // no sinks: the EAGLE3 draft
     float mt = sink;
     for (int s = 0; s < ns; ++s) mt = fmaxf(mt, base[s * (kHD + 2)]);
-    float l = __expf(sink - mt), a = 0.f;
+    float l = sinks ? __expf(sink - mt) : 0.f, a = 0.f;
     for (int s = 0; s < ns; ++s) {
         const float* o = base + s * (kHD + 2);
         const float f = __expf(o[0] - mt);
@@ -1178,6 +1179,75 @@ bool use_mmq_wmma() {
     return v;
 }
 
+__global__ void k_rmsnorm_strided(const float* __restrict__ x, int ldx, const float* __restrict__ w,
+                                  float* __restrict__ y, int ldy, int n, float eps) {
+    const int c = blockIdx.x;
+    x += (size_t) c * ldx;
+    y += (size_t) c * ldy;
+    __shared__ float red[32];
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
+    ss = warp_sum(ss);
+    const int lane = threadIdx.x % WS, wid = threadIdx.x / WS, nw = blockDim.x / WS;
+    if (lane == 0) red[wid] = ss;
+    __syncthreads();
+    if (wid == 0) {
+        float v = lane < nw ? red[lane] : 0.f;
+        v = warp_sum(v);
+        if (lane == 0) red[0] = v;
+    }
+    __syncthreads();
+    const float inv = rsqrtf(red[0] / (float) n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * inv * w[i];
+}
+
+__global__ void k_silu_mul(const float* __restrict__ gu, float* __restrict__ act, int n) {
+    const int c = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = gu[(size_t) c * 2 * n + i], u = gu[(size_t) c * 2 * n + n + i];
+    act[(size_t) c * n + i] = g / (1.f + __expf(-g)) * u;
+}
+
+__global__ void k_argmax_map(const float* __restrict__ lg, int n, const int32_t* __restrict__ map,
+                             int32_t* __restrict__ out) {
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    float best = -INFINITY;
+    int idx = 0x7fffffff;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        if (lg[i] > best || (lg[i] == best && i < idx)) { best = lg[i]; idx = i; }
+#pragma unroll
+    for (int o = WS / 2; o > 0; o >>= 1) {
+        const float ob = __shfl_xor(best, o, WS);
+        const int oi = __shfl_xor(idx, o, WS);
+        if (ob > best || (ob == best && oi < idx)) { best = ob; idx = oi; }
+    }
+    const int lane = threadIdx.x % WS, wid = threadIdx.x / WS, nw = blockDim.x / WS;
+    if (lane == 0) { bv[wid] = best; bi[wid] = idx; }
+    __syncthreads();
+    __shared__ float mx;
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < nw; ++w)
+            if (bv[w] > best || (bv[w] == best && bi[w] < idx)) { best = bv[w]; idx = bi[w]; }
+        out[0] = map ? map[idx] : idx;
+        mx = best;
+    }
+    __syncthreads();
+    // out[1] = the pick's softmax probability (float bits): 1 / sum exp(l - max)
+    float se = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) se += __expf(lg[i] - mx);
+    se = warp_sum(se);
+    __syncthreads();
+    if (lane == 0) bv[wid] = se;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int w = 0; w < nw; ++w) t += bv[w];
+        out[1] = __float_as_int(1.f / t);
+    }
+}
+
 unsigned cdiv(size_t a, size_t b) { return (unsigned) ((a + b - 1) / b); }
 
 } // namespace
@@ -1384,6 +1454,19 @@ void gather_rows_q8(const int8_t* q, const float* d, const int32_t* rows, int8_t
                     hipStream_t s) {
     if (count <= 0) return;
     hipLaunchKernelGGL(k_gather_rows_q8, dim3(count), dim3(128), 0, s, q, d, rows, oq, od, n);
+}
+
+void rmsnorm_strided(const float* x, int ldx, const float* w, float* y, int ldy, int n, int ncols, float eps,
+                     hipStream_t s) {
+    hipLaunchKernelGGL(k_rmsnorm_strided, dim3(ncols), dim3(256), 0, s, x, ldx, w, y, ldy, n, eps);
+}
+
+void silu_mul(const float* gu, float* act, int n, int ncols, hipStream_t s) {
+    hipLaunchKernelGGL(k_silu_mul, dim3(cdiv(n, 256), ncols), dim3(256), 0, s, gu, act, n);
+}
+
+void argmax_map(const float* logits, int n, const int32_t* map, int32_t* out, hipStream_t s) {
+    hipLaunchKernelGGL(k_argmax_map, dim3(1), dim3(1024), 0, s, logits, n, map, out);
 }
 
 } // namespace oss

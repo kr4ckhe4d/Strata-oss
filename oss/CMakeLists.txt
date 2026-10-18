@@ -20,7 +20,9 @@ option(STRATA_OSS_NATIVE "Compile the CPU kernels for this machine's CPU (-march
 add_executable(strata-oss oss_main.cpp oss_engine.cpp oss_cpu.cpp oss_kernels.hip)
 target_include_directories(strata-oss PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 target_link_libraries(strata-oss PRIVATE hip::host roc::hipblas pthread)
-set_source_files_properties(oss_kernels.hip PROPERTIES COMPILE_OPTIONS "-O3;-ffast-math")
+# no -ffast-math: with it the 1..8-column kernels round differently (reassociation), and a verify window would not
+# give the same tokens as single steps (measured: oss/FINDINGS.md section 13); speed is the same without it
+set_source_files_properties(oss_kernels.hip PROPERTIES COMPILE_OPTIONS "-O3")
 if(STRATA_OSS_NATIVE)
   set_source_files_properties(oss_cpu.cpp PROPERTIES COMPILE_OPTIONS "-O3;-march=native")
 else()

@@ -54,6 +54,8 @@ public:
     /// (all of them when all_logits: [tokens.size()][n_vocab]).
     const float* eval(const std::vector<int32_t>& tokens, bool all_logits = false);
     int n_past() const;
+    /// Drops the cache positions from n on (the rejected drafts of a verify window).
+    void truncate(int n);
     const std::vector<int32_t>& history() const;
 
     Stats& stats();

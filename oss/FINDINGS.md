@@ -177,3 +177,37 @@ Prompt speed at long context is unchanged (16K 857, 32K 570 tok/s): that is `k_a
   now spread over dense projections (hipBLAS, ~3 s at 16K), attention and experts.
 - A bigger chunk's scratch takes VRAM from the expert cache (60 slots per doubling at 4K, 120 at 8K), which costs
   output speed: 8K -4%. Default is now 4,096 (+9% prompts, -1% output); `--chunk 8192` for long-document work.
+
+## 13. Speculative decoding: verify cost, prompt lookup, and why -ffast-math had to go
+
+**What a verify window costs** (120b, 1K context, `--bench-verify`, mean of 20 steps):
+
+| tokens checked in one step | 1 | 2 | 3 | 4 | 6 | 8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ms a step | 9.28 | 11.96 | 14.32 | 16.64 | 21.26 | 26.64 |
+| relative to 1 | 1.00 | 1.29 | 1.54 | 1.79 | 2.29 | 2.87 |
+
+Cheap enough: the dense weights and the attention are read once for all columns; what grows is the experts (each
+extra token brings ~4 more per layer, partly shared, partly CPU misses). So a drafter pays when it keeps > ~0.8 of
+3 drafts.
+
+**Prompt lookup** (`oss_spec.hpp`): drafts the continuation of the latest earlier match of the last 2-4 tokens; the
+number of drafts is the k with the most expected tokens per unit of the measured step cost, from the running
+acceptance rate (0 = no draft, a 2-token probe every 16 steps). Sampling stays exact (a draft is kept with the
+target's probability, else redrawn without it); greedy keeps a draft only when it is the argmax.
+
+| 120b, greedy, profile placement, adaptation off | no drafts | prompt lookup | tokens a step |
+| --- | ---: | ---: | ---: |
+| explain-in-3-paragraphs prompt | 103.6 tok/s | 103.4 tok/s | 1.01 (the cost model declines) |
+| rename a variable in a 40-line function | 81.9 tok/s | **101.3 tok/s (+24%)** | 1.89 |
+
+**-ffast-math broke "the drafts never change the answer"**: with it, greedy with drafts gave different tokens on the
+first prompt. Checked on 20b: logits of 493 positions computed 1 column a step vs 8 columns a step were bitwise equal
+at 0 positions (pos 0 already differed by 0.149) with `-ffast-math`, and at all 493 without it, at the same speed
+(164 vs 166 tok/s at 1 column, 462 vs 466 at 8). Reassociation lets the compiler sum differently in the 1..8-column
+template instances. The kernels now build without it, and greedy output with drafts is token-identical to without
+(both prompts above).
+
+**The output-speed jump to ~104 tok/s is the profile, not the drafts**: VRAM now covers 97% of routings vs 77% on the
+first start (the profile saved by earlier runs). Adaptation itself costs nothing measurable: 105.4 / 104.8 / 105.1
+tok/s with swaps off / every 16 / every 64 steps.

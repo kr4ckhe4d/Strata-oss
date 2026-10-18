@@ -5,6 +5,7 @@
 //     --dump-logits OUT --tokens FILE   teacher-forced logits of every position (float32 [n][vocab]) to OUT
 //     --serve                           JSON lines on stdin/stdout (oss/server.py speaks it)
 #include "oss_engine.hpp"
+#include "oss_spec.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -24,6 +25,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+using oss::Sampler;
 
 namespace {
 
@@ -144,42 +147,6 @@ void emit(const std::string& line) {
     std::fflush(stdout);
 }
 
-// ---------------------------------------------------------------- sampling
-struct Sampler {
-    double temp = 0, top_p = 1, min_p = 0;
-    int top_k = 0;
-    std::mt19937_64 rng{1};
-    std::vector<std::pair<float, int>> cand;
-    int pick(const float* lg, int V) {
-        if (temp <= 0) return (int) (std::max_element(lg, lg + V) - lg);
-        cand.clear();
-        const float mx = *std::max_element(lg, lg + V);
-        // keep what can matter: logits within 30 / temp of the best
-        const float cut = mx - 30.f * (float) temp;
-        for (int i = 0; i < V; ++i)
-            if (lg[i] >= cut) cand.push_back({lg[i], i});
-        std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
-        if (top_k > 0 && (int) cand.size() > top_k) cand.resize(top_k);
-        std::vector<double> p(cand.size());
-        double s = 0;
-        for (size_t i = 0; i < cand.size(); ++i) { p[i] = std::exp((cand[i].first - mx) / temp); s += p[i]; }
-        for (auto& x : p) x /= s;
-        size_t n = p.size();
-        if (top_p < 1) {
-            double c = 0;
-            for (size_t i = 0; i < p.size(); ++i) { c += p[i]; if (c >= top_p) { n = i + 1; break; } }
-        }
-        if (min_p > 0)
-            for (size_t i = 1; i < n; ++i) if (p[i] < min_p * p[0]) { n = i; break; }
-        double tot = 0;
-        for (size_t i = 0; i < n; ++i) tot += p[i];
-        std::uniform_real_distribution<double> u(0, tot);
-        double r = u(rng), c = 0;
-        for (size_t i = 0; i < n; ++i) { c += p[i]; if (r <= c) return cand[i].second; }
-        return cand[n - 1].second;
-    }
-};
-
 std::vector<int32_t> read_ids(const std::string& path) {
     std::ifstream f(path);
     std::vector<int32_t> v;
@@ -209,6 +176,8 @@ int main(int argc, char** argv) {
     oss::Options o;
     std::string tokens_file, dump, mode = "gen";
     int n_predict = 128;
+    bool spec = true;
+    int draft_max = 7;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -234,6 +203,8 @@ int main(int argc, char** argv) {
         else if (a == "--dump-logits") { dump = next(); mode = "dump"; }
         else if (a == "--serve") mode = "serve";
         else if (a == "--bench-verify") mode = "verify";
+        else if (a == "--no-spec") spec = false;
+        else if (a == "--draft-max") draft_max = std::atoi(next().c_str());
         else if (a == "-v") o.verbose = true;
         else { usage(); return 2; }
     }
@@ -286,14 +257,26 @@ int main(int argc, char** argv) {
             const auto t1 = std::chrono::steady_clock::now();
             std::vector<int32_t> out;
             Sampler smp;
-            for (int i = 0; i < n_predict; ++i) {
-                const int t = smp.pick(lg, V);
-                out.push_back(t);
-                std::printf("%d ", t);
+            oss::Generator gen(eng, smp);
+            gen.spec = spec;
+            gen.max_draft = draft_max;
+            gen.begin(lg);
+            const std::vector<int32_t> stop = {eng.eos(), 200012, 199999};
+            while ((int) out.size() < n_predict) {
+                auto toks = gen.next(stop);
+                bool end = false;
+                for (int t : toks) {
+                    out.push_back(t);
+                    std::printf("%d ", t);
+                    if (std::find(stop.begin(), stop.end(), t) != stop.end()) end = true;
+                }
                 std::fflush(stdout);
-                if (t == eng.eos() || t == 200012 || t == 199999) break;
-                lg = eng.eval({t});
+                if (end) break;
             }
+            std::fprintf(stderr, "strata-oss: %llu steps, %llu drafted, %llu kept (%.2f tokens a step)\n",
+                         (unsigned long long) gen.st.steps, (unsigned long long) gen.st.drafted,
+                         (unsigned long long) gen.st.accepted,
+                         gen.st.steps ? (double) gen.st.emitted / gen.st.steps : 0.0);
             const auto t2 = std::chrono::steady_clock::now();
             std::printf("\n");
             const double tp = std::chrono::duration<double>(t1 - t0).count();
@@ -373,24 +356,31 @@ int main(int argc, char** argv) {
             const float* lg = nullptr;
             std::string reason = "length";
             int n_gen = 0;
+            uint64_t spec_steps = 0;
             double t_prompt = 0;
             try {
                 lg = eng.eval(rest);
                 const auto t1 = std::chrono::steady_clock::now();
                 t_prompt = std::chrono::duration<double>(t1 - t0).count();
-                for (; n_gen < max_tokens;) {
+                oss::Generator gen(eng, smp);
+                gen.spec = spec && !req.get("no_spec");
+                gen.max_draft = draft_max;
+                gen.begin(lg);
+                bool end = false;
+                while (!end && n_gen < max_tokens) {
                     if (cancel.load()) { reason = "cancel"; break; }
-                    const int t = smp.pick(lg, V);
-                    ++n_gen;
-                    {
+                    if (eng.n_past() + 2 >= eng.n_ctx()) { reason = "context"; break; }
+                    auto toks = gen.next(stops);
+                    for (int t : toks) {
+                        ++n_gen;
                         std::ostringstream ss;
                         ss << "{\"type\":\"token\",\"id\":" << t << "}";
                         emit(ss.str());
+                        if (std::find(stops.begin(), stops.end(), t) != stops.end()) { reason = "stop"; end = true; break; }
+                        if (n_gen >= max_tokens) break;
                     }
-                    if (std::find(stops.begin(), stops.end(), t) != stops.end()) { reason = "stop"; break; }
-                    if (eng.n_past() + 1 >= eng.n_ctx()) { reason = "context"; break; }
-                    lg = eng.eval({t});
                 }
+                spec_steps = gen.st.steps;
             } catch (std::exception& e) {
                 std::ostringstream ss;
                 ss << "{\"type\":\"error\",\"error\":\"" << e.what() << "\"}";
@@ -405,7 +395,7 @@ int main(int argc, char** argv) {
             std::ostringstream ss;
             ss << "{\"type\":\"done\",\"reason\":\"" << reason << "\",\"n_gen\":" << n_gen
                << ",\"n_prompt\":" << toks.size() << ",\"n_reused\":" << reused << ",\"t_prompt\":" << t_prompt
-               << ",\"t_gen\":" << (tt - t_prompt) << "}";
+               << ",\"t_gen\":" << (tt - t_prompt) << ",\"steps\":" << spec_steps << "}";
             emit(ss.str());
             eng.report(stderr);
         }

@@ -1022,7 +1022,8 @@ struct Engine::Impl {
         static const bool force_decode = std::getenv("OSS_FORCE_DECODE") != nullptr;
         const bool prompt = toks.size() > (size_t) kMaxCols && !force_decode;
         while (i < toks.size()) {
-            const int n = (int) std::min(toks.size() - i, (size_t) (prompt ? o.chunk : kMaxCols));
+            static const int max_cols = std::getenv("OSS_MAX_COLS") ? std::atoi(std::getenv("OSS_MAX_COLS")) : kMaxCols;
+            const int n = (int) std::min(toks.size() - i, (size_t) (prompt ? o.chunk : max_cols));
             if (n > kMaxCols) {
                 prompt_chunk(toks.data() + i, n, want_all);
                 last = logits_h;
@@ -1103,6 +1104,12 @@ const std::vector<std::string>& Engine::vocab() const { return p_->vocab; }
 int Engine::reuse_prefix(const std::vector<int32_t>& t) { return p_->reuse_prefix(t); }
 const float* Engine::eval(const std::vector<int32_t>& t, bool all) { return p_->eval(t, all); }
 int Engine::n_past() const { return p_->npast; }
+void Engine::truncate(int n) {
+    if (n < p_->npast) {
+        p_->npast = n;
+        p_->hist.resize(n);
+    }
+}
 const std::vector<int32_t>& Engine::history() const { return p_->hist; }
 Stats& Engine::stats() { return p_->st; }
 void Engine::save_profile() { p_->save_profile(); }

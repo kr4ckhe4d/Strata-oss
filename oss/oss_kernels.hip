@@ -117,13 +117,21 @@ __global__ void k_rmsnorm_quant(const float* __restrict__ x, const float* __rest
     }
 }
 
-__global__ void k_quant_q8(const float* __restrict__ x, int8_t* __restrict__ q, float* __restrict__ d, int n,
+template <class T>
+__device__ __forceinline__ float ldf(const T* p, long i);
+template <>
+__device__ __forceinline__ float ldf<float>(const float* p, long i) { return p[i]; }
+template <>
+__device__ __forceinline__ float ldf<uint16_t>(const uint16_t* p, long i) { return __half2float(__ushort_as_half(p[i])); }
+
+template <class T>
+__global__ void k_quant_q8(const T* __restrict__ x, int8_t* __restrict__ q, float* __restrict__ d, int n,
                            int nvec) {
     const int lane = threadIdx.x % WS;
     const int nb = n / 32;
     const long gb = (long) blockIdx.x * (blockDim.x / WS) + threadIdx.x / WS;  // global block index
     if (gb >= (long) nb * nvec) return;
-    const float v = x[gb * 32 + lane];
+    const float v = ldf(x, gb * 32 + lane);
     const float amax = warp_max(fabsf(v));
     const float dd = amax / 127.f;
     const float id = dd ? 1.f / dd : 0.f;
@@ -1058,24 +1066,33 @@ __global__ void __launch_bounds__(128) k_attn_prompt_wmma(const float* __restric
 // Per 32-value block: two 16x16x16 int8 WMMAs into an int tile, then the block's two scales (weight row, token).
 typedef int v2i __attribute__((ext_vector_type(2)));
 typedef int v8i __attribute__((ext_vector_type(8)));
-template <int MATS, int RSUB>
+// Q8 = true: a dense Q8_0 matrix (planes q8w / q8d) over every token (tiles == nullptr, tile0 = the token count),
+// y = W x + bias (accumulated into outp when acc).
+template <int MATS, int RSUB, bool Q8 = false>
 __global__ void __launch_bounds__(128) k_mmq_wmma(const uint8_t* const* __restrict__ wptr,
                                                   const int4* __restrict__ tiles, int tile0,
                                                   const int8_t* __restrict__ xq, const float* __restrict__ xd,
                                                   const float* __restrict__ b0p, const float* __restrict__ b1p,
                                                   float* __restrict__ outp, int n_in, int n_out, size_t mat_off,
-                                                  size_t mat_stride) {
+                                                  size_t mat_stride, const int8_t* __restrict__ q8w = nullptr,
+                                                  const uint16_t* __restrict__ q8d = nullptr, bool acc_out = false) {
 #if defined(OSS_WMMA)
-    constexpr int KB = 4, WR = 16 * RSUB, TM = 4 * WR, RP = KB * 32 + 8;
+    constexpr int KB = 4, WR = 16 * RSUB, TM = 4 * WR, RP = KB * 32 + 16;  // rows 16-byte aligned
     __shared__ int8_t W[MATS][TM][RP];
     __shared__ float Wd[MATS][TM][KB];
     __shared__ int8_t X[kTN][RP];
     __shared__ float Xd[kTN][KB];
-    const int4 tl = tiles[tile0 + blockIdx.y];
-    const int e = tl.x, r0 = tl.y, nt = tl.z;
+    int e = 0, r0, nt;
+    if (Q8) {
+        r0 = blockIdx.y * kTN;
+        nt = min(kTN, tile0 - r0);
+    } else {
+        const int4 tl = tiles[tile0 + blockIdx.y];
+        e = tl.x; r0 = tl.y; nt = tl.z;
+    }
     const int row0 = blockIdx.x * TM;
     const int nb = n_in / 32;
-    const uint8_t* mat0 = wptr[e] + mat_off;
+    const uint8_t* mat0 = Q8 ? nullptr : wptr[e] + mat_off;
     const int wv = threadIdx.x / WS, lane = threadIdx.x % WS, lr = lane % 16, lh = lane / 16;
     float acc[MATS][RSUB][2][8];
 #pragma unroll
@@ -1091,7 +1108,12 @@ __global__ void __launch_bounds__(128) k_mmq_wmma(const uint8_t* const* __restri
             const int m = idx / (TM * KB), rem = idx % (TM * KB), r = rem / KB, kb = rem % KB;
             const int row = row0 + r, b = b0 + kb;
             int* dst = (int*) &W[m][r][kb * 32];
-            if (row < n_out && b < nb) {
+            if (Q8 && row < n_out && b < nb) {
+                const int4* src = (const int4*) (q8w + (size_t) row * n_in + b * 32);
+                *(int4*) dst = src[0];
+                *(int4*) (dst + 4) = src[1];
+                Wd[m][r][kb] = h2f(q8d[(size_t) row * nb + b]);
+            } else if (!Q8 && row < n_out && b < nb) {
                 const uint8_t* base = mat0 + m * mat_stride;
                 const uint4 qv = ((const uint4*) base)[(size_t) row * nb + b];
                 const uint32_t q[4] = {qv.x, qv.y, qv.z, qv.w};
@@ -1160,7 +1182,9 @@ __global__ void __launch_bounds__(128) k_mmq_wmma(const uint8_t* const* __restri
                     const float u = acc[MATS - 1][rs][ns][i] + b1p[(size_t) e * n_out + row];
                     outp[(size_t) (r0 + tok) * n_out + row] = swiglu_oai(g, u);
                 } else {
-                    outp[(size_t) (r0 + tok) * n_out + row] = acc[0][rs][ns][i];
+                    float v = acc[0][rs][ns][i] + (Q8 && b0p ? b0p[row] : 0.f);
+                    float* o = outp + (size_t) (r0 + tok) * n_out + row;
+                    *o = Q8 && acc_out ? *o + v : v;
                 }
             }
         }
@@ -1265,7 +1289,7 @@ void rmsnorm(const float* x, const float* w, float* y, int n, int ncols, float e
 
 void quant_q8(const float* x, int8_t* q, float* d, int n, int nvec, hipStream_t s) {
     const size_t blocks = (size_t) (n / 32) * nvec;
-    hipLaunchKernelGGL(k_quant_q8, dim3(cdiv(blocks, 8)), dim3(256), 0, s, x, q, d, n, nvec);
+    hipLaunchKernelGGL(k_quant_q8<float>, dim3(cdiv(blocks, 8)), dim3(256), 0, s, x, q, d, n, nvec);
 }
 
 void mv_q8_0(const int8_t* wq, const uint16_t* wd, const int8_t* xq, const float* xd, const float* bias, float* y,
@@ -1467,6 +1491,20 @@ void silu_mul(const float* gu, float* act, int n, int ncols, hipStream_t s) {
 
 void argmax_map(const float* logits, int n, const int32_t* map, int32_t* out, hipStream_t s) {
     hipLaunchKernelGGL(k_argmax_map, dim3(1), dim3(1024), 0, s, logits, n, map, out);
+}
+
+void quant_q8_f16(const uint16_t* x, int8_t* q, float* d, int n, int nvec, hipStream_t s) {
+    const size_t blocks = (size_t) (n / 32) * nvec;
+    hipLaunchKernelGGL(k_quant_q8<uint16_t>, dim3(cdiv(blocks, 8)), dim3(256), 0, s, x, q, d, n, nvec);
+}
+
+bool dense_q8_wmma(const int8_t* wq, const uint16_t* wd, const int8_t* xq, const float* xd, const float* bias, float* y,
+                   int n_in, int n_out, int ntok, bool accumulate, hipStream_t s) {
+    if (!use_mmq_wmma()) return false;
+    hipLaunchKernelGGL((k_mmq_wmma<1, 2, true>), dim3(cdiv(n_out, 128), cdiv(ntok, kTN)), dim3(128), 0, s,
+                       (const uint8_t* const*) nullptr, (const int4*) nullptr, ntok, xq, xd, bias, (const float*) nullptr,
+                       y, n_in, n_out, (size_t) 0, (size_t) 0, wq, wd, accumulate);
+    return true;
 }
 
 } // namespace oss

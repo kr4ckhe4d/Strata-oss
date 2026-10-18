@@ -263,3 +263,20 @@ pairs; base 500000, YaRN factor 32), its attention has no sinks, its MLP is a de
 - Prompt lookup still goes first when it finds a match (free drafts); the code-edit prompt stays ~98-101 tok/s.
 - Server, EAGLE3 on: a code answer at temperature 0: 98.6 tok/s, at temperature 1.0: 107.3 tok/s (sampling stays
   exact: a draft is kept with the target's probability).
+
+## 16. Dense projections on int8 WMMA
+
+The prompt path's q/k/v and output projections no longer go through dequant-to-f16 + hipBLAS (10-15 TFLOPS on
+gfx1201, section 7): the int8 WMMA expert kernel got a Q8_0 weight loader (the weight's int8 plane straight into LDS,
+its f16 scale per 32), activations rounded to int8 per 32 (as llama.cpp's MMQ). `OSS_DENSE_WMMA=0` = the old path.
+The LDS rows were padded 136 -> 144 bytes so the 16-byte stores are aligned (136 worked, but by luck of the
+hardware's unaligned mode).
+
+20b, 2,000-token document: perplexity 23.45 both ways, top-1 45.2% -> 44.5%, KL 0.027 between them (int8
+activations differ a little more from f16 than f16 does from itself).
+
+| 120b prompt | hipBLAS f16 | int8 WMMA |
+| --- | ---: | ---: |
+| 1,005 tokens | 1,406 tok/s | 1,809 tok/s |
+| 16,000 | 1,929 | 2,712 |
+| 32,000 | 1,723 | 2,328 |

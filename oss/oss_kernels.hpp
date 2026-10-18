@@ -139,4 +139,9 @@ void silu_mul(const float* gu, float* act, int n, int ncols, hipStream_t s);
 // out[0] = map[argmax(logits[0..n))], out[1] = its softmax probability (float bits)
 void argmax_map(const float* logits, int n, const int32_t* map, int32_t* out, hipStream_t s);
 
+void quant_q8_f16(const uint16_t* x, int8_t* q, float* d, int n, int nvec, hipStream_t s);
+// prompt-path dense Q8_0 matrix on int8 WMMA (gfx120x): y[t] = W x[t] + bias (+= when accumulate); false: not available
+bool dense_q8_wmma(const int8_t* wq, const uint16_t* wd, const int8_t* xq, const float* xd, const float* bias, float* y,
+                   int n_in, int n_out, int ntok, bool accumulate, hipStream_t s);
+
 } // namespace oss

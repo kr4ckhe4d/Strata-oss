@@ -140,7 +140,8 @@ struct Dev {
     // prompt scratch
     float *px = nullptr, *pqkv = nullptr, *py = nullptr, *ph32 = nullptr, *plog = nullptr, *ptopw = nullptr;
     float *ys = nullptr, *pact = nullptr, *pqd = nullptr, *xsd = nullptr, *pad = nullptr;
-    int8_t *pq = nullptr, *xsq = nullptr, *paq = nullptr;
+    int8_t *pq = nullptr, *xsq = nullptr, *paq = nullptr, *aoq_p = nullptr;
+    float* aod_p = nullptr;
     int32_t* tiles = nullptr;
     const uint8_t** wptr = nullptr;
     hipEvent_t staged = nullptr;
@@ -521,6 +522,8 @@ struct Engine::Impl {
         d.inv = dalloc<int32_t>(C * kTopK);
         d.ys = dalloc<float>(C * kTopK * H);
         d.pq = dalloc<int8_t>(C * H);
+        d.aoq_p = dalloc<int8_t>(C * NA);
+        d.aod_p = dalloc<float>(C * NA / 32);
         d.pqd = dalloc<float>(C * H / 32);
         d.xsq = dalloc<int8_t>(C * kTopK * H);
         d.xsd = dalloc<float>(C * kTopK * H / 32);
@@ -1165,10 +1168,21 @@ struct Engine::Impl {
         hipStream_t s = d.s;
         static const bool prof = std::getenv("OSS_PROF") != nullptr;
         const auto tp0 = Clock::now();
-        rmsnorm_f16(d.px, L.attn_norm, nullptr, d.xn16, H, ntok, hp.eps, s);
-        dequant_q8_0_f16(L.qkv_q, L.qkv_d, d.w16, H, R, s);
-        gemm16(d, d.w16, R, H, d.xn16, ntok, d.pqkv);
-        add_bias(d.pqkv, L.qkv_b, R, ntok, s);
+        static const bool dense_wmma = [] {
+            const char* v = std::getenv("OSS_DENSE_WMMA");
+            return v ? std::atoi(v) != 0 : true;
+        }();
+        bool qkv_done = false;
+        if (dense_wmma) {
+            rmsnorm_quant(d.px, L.attn_norm, nullptr, d.pq, d.pqd, H, ntok, hp.eps, s);
+            qkv_done = dense_q8_wmma(L.qkv_q, L.qkv_d, d.pq, d.pqd, L.qkv_b, d.pqkv, H, R, ntok, false, s);
+        }
+        if (!qkv_done) {
+            rmsnorm_f16(d.px, L.attn_norm, nullptr, d.xn16, H, ntok, hp.eps, s);
+            dequant_q8_0_f16(L.qkv_q, L.qkv_d, d.w16, H, R, s);
+            gemm16(d, d.w16, R, H, d.xn16, ntok, d.pqkv);
+            add_bias(d.pqkv, L.qkv_b, R, ntok, s);
+        }
         // OSS_PROF=1: where the attention block's time goes (synchronizes after each piece)
         Clock::time_point last = tp0;
         auto mark = [&](double& acc) {
@@ -1183,9 +1197,16 @@ struct Engine::Impl {
         rope_store_prompt(d.pqkv, L.kc, L.vc, pos0, hp.NH, hp.NKV, hp.HD, L.cap, hp.rope, ntok, s);
         attn_prompt(d.pqkv, L.kc, L.vc, L.sinks, pos0, d.ao16, hp.NH, hp.NKV, hp.HD, L.cap, L.window, ntok, s);
         mark(t_attn);
-        dequant_q8_0_f16(L.o_q, L.o_d, d.w2, NA, H, s);
-        gemm16(d, d.w2, H, NA, d.ao16, ntok, d.py);
-        add_bias_residual(d.px, d.py, L.o_b, H, ntok, s);
+        bool o_done = false;
+        if (dense_wmma) {
+            quant_q8_f16(d.ao16, d.aoq_p, d.aod_p, NA, ntok, s);
+            o_done = dense_q8_wmma(L.o_q, L.o_d, d.aoq_p, d.aod_p, L.o_b, d.px, NA, H, ntok, true, s);  // px += W a + b
+        }
+        if (!o_done) {
+            dequant_q8_0_f16(L.o_q, L.o_d, d.w2, NA, H, s);
+            gemm16(d, d.w2, H, NA, d.ao16, ntok, d.py);
+            add_bias_residual(d.px, d.py, L.o_b, H, ntok, s);
+        }
         mark(t_o);
         rmsnorm_f16(d.px, L.post_norm, d.ph32, nullptr, H, ntok, hp.eps, s);
         {

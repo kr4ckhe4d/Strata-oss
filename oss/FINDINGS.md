@@ -305,3 +305,20 @@ reasoning effort, the saved profile, 300 generated tokens; llama.cpp = the best 
 Not measured: llama.cpp at 16K / 32K on this PC, other GPUs (the kernels are gfx120x-tuned; the WMMA paths need
 gfx1200/1201, the rest falls back), CUDA (the engine is HIP-only), Windows, gpt-oss-20b with EAGLE3 (its draft
 model's target layers differ), the server under several clients (it serves one answer at a time).
+
+## 18. CPU misses grouped across a verify window
+
+Before, a verify window's CPU misses were one job per (column, expert): two columns routed to the same CPU expert
+read its 12.6 MiB from RAM twice. Now the jobs are grouped by expert and a 2-row x 1..8-column kernel decodes each
+weight block once and dots it with every column (`OSS_GROUP_MISSES=0`: the old way). Per column the accumulation is
+the single-column kernel's exactly, so results are bitwise unchanged: 20b with half the experts on the CPU, logits of
+493 positions computed 1 vs 8 columns a step are bitwise equal at all 493.
+
+| 8-token windows (decode path), 20b on the R9700 | ungrouped | grouped |
+| --- | ---: | ---: |
+| 384 of 768 experts in VRAM | 128.9 tok/s | 186.3 (+45%) |
+| 192 of 768 | 89.9 | 132.0 (+47%) |
+
+On the 120b with the matured profile (97% hits) few CPU experts are shared, so the gain is small: an 8-token verify
+step 26.64 -> 25.70 ms, EAGLE3 prose 116.4 -> 117.5, code 116.1 -> 119.5 tok/s. It matters for a smaller GPU (more
+experts on the CPU) and for batching several conversations.

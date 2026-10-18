@@ -3,6 +3,8 @@
 #include "oss_cpu.hpp"
 
 #include <cmath>
+#include <cstdlib>
+#include <algorithm>
 #include <cstring>
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -99,6 +101,45 @@ void mxfp4_row_dot2(const uint8_t* qs0, const uint8_t* e0, const uint8_t* qs1, c
     *out0 = mxfp4_row_dot(qs0, e0, xq, xd, nb);
     *out1 = mxfp4_row_dot(qs1, e1, xq, xd, nb);
 #endif
+}
+
+
+// Two rows against NC activations at once: each weight block is decoded once and used for every column.  Per column
+// the accumulation is mxfp4_row_dot2's exactly (one accumulator a row, block by block, then the same horizontal sum),
+// so a column's result is bitwise what a single-column call gives.
+template <int NC>
+static void rows2_cols(const uint8_t* qs0, const uint8_t* e0, const uint8_t* qs1, const uint8_t* e1,
+                       const int8_t* const* xq, const float* const* xd, int nb, float* out0, float* out1) {
+#if defined(__AVX2__)
+    const __m128i values = _mm_loadu_si128((const __m128i*) kValues);
+    const __m128i m4b = _mm_set1_epi8(0x0f);
+    __m256 a0[NC], a1[NC];
+    for (int c = 0; c < NC; ++c) { a0[c] = _mm256_setzero_ps(); a1[c] = _mm256_setzero_ps(); }
+    for (int b = 0; b < nb; ++b) {
+        const __m256i w0 = expand(qs0 + b * 16, values, m4b);
+        const __m256i w1 = expand(qs1 + b * 16, values, m4b);
+        const float s0 = e8m0_half(e0[b]), s1 = e8m0_half(e1[b]);
+        for (int c = 0; c < NC; ++c) {
+            const __m256i x = _mm256_loadu_si256((const __m256i*) (xq[c] + b * 32));
+            a0[c] = _mm256_fmadd_ps(_mm256_set1_ps(s0 * xd[c][b]), _mm256_cvtepi32_ps(dot_i8(w0, x)), a0[c]);
+            a1[c] = _mm256_fmadd_ps(_mm256_set1_ps(s1 * xd[c][b]), _mm256_cvtepi32_ps(dot_i8(w1, x)), a1[c]);
+        }
+    }
+    for (int c = 0; c < NC; ++c) { out0[c] = hsum8(a0[c]); out1[c] = hsum8(a1[c]); }
+#else
+    for (int c = 0; c < NC; ++c) mxfp4_row_dot2(qs0, e0, qs1, e1, xq[c], xd[c], nb, &out0[c], &out1[c]);
+#endif
+}
+
+static void rows2_cols_n(int nc, const uint8_t* qs0, const uint8_t* e0, const uint8_t* qs1, const uint8_t* e1,
+                         const int8_t* const* xq, const float* const* xd, int nb, float* out0, float* out1) {
+    switch (nc) {
+#define C(N) case N: rows2_cols<N>(qs0, e0, qs1, e1, xq, xd, nb, out0, out1); break;
+        C(1) C(2) C(3) C(4) C(5) C(6) C(7) C(8)
+#undef C
+        default:
+            for (int c = 0; c < nc; ++c) mxfp4_row_dot2(qs0, e0, qs1, e1, xq[c], xd[c], nb, &out0[c], &out1[c]);
+    }
 }
 
 void quant_q8(const float* x, int8_t* q, float* d, int n) {
@@ -214,53 +255,81 @@ void compute_misses(Pool& pool, const std::vector<MissJob>& jobs, const int8_t* 
     const int nbh = H / 32, nbf = F / 32;
     const size_t gate_bytes = (size_t) F * nbh * 17;
     const size_t down_off = 2 * gate_bytes;
-    // work units of 32 rows: phase 1 the gate/up rows of every job, phase 2 the down rows
-    const int u1 = nj * (F / 32), u2 = nj * (H / 32);
+    // the jobs of one expert (the columns of a verify window that routed to it) share every weight read
+    std::vector<int> order(nj);
+    for (int j = 0; j < nj; ++j) order[j] = j;
+    static const bool group = [] {
+        const char* v = std::getenv("OSS_GROUP_MISSES");
+        return v ? std::atoi(v) != 0 : true;
+    }();
+    if (group) std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return jobs[a].blob < jobs[b].blob; });
+    std::vector<int> g0;  // group starts in `order`
+    for (int i = 0; i < nj; ++i)
+        if (i == 0 || !group || jobs[order[i]].blob != jobs[order[i - 1]].blob) g0.push_back(i);
+    const int ng = (int) g0.size();
+    g0.push_back(nj);
+    // work units of 32 rows: phase 1 the gate/up rows of every expert, phase 2 the down rows
+    const int u1 = ng * (F / 32), u2 = ng * (H / 32);
     std::atomic<int> next1{0}, next2{0};
     auto fn = [&](int, int) {
+        const int8_t* xq[8];
+        const float* xd[8];
+        float gv[8], uv[8], act[8][32];
         for (;;) {
             const int u = next1.fetch_add(1, std::memory_order_relaxed);
             if (u >= u1) break;
-            const int j = u / (F / 32), rb = u % (F / 32);
-            const MissJob& job = jobs[j];
-            const int8_t* xq = hq + (size_t) job.col * hq_stride;
-            const float* xd = hd + (size_t) job.col * hd_stride;
-            const uint8_t* g = job.blob;
-            const uint8_t* up = job.blob + gate_bytes;
-            float act[32];
+            const int g = u / (F / 32), rb = u % (F / 32);
+            const int nc = g0[g + 1] - g0[g];
+            const MissJob& j0 = jobs[order[g0[g]]];
+            for (int c = 0; c < nc; ++c) {
+                const MissJob& jb = jobs[order[g0[g] + c]];
+                xq[c] = hq + (size_t) jb.col * hq_stride;
+                xd[c] = hd + (size_t) jb.col * hd_stride;
+            }
+            const uint8_t* gm = j0.blob;
+            const uint8_t* up = j0.blob + gate_bytes;
             for (int i = 0; i < 32; ++i) {
                 const int r = rb * 32 + i;
-                float gv, uv;
-                mxfp4_row_dot2(g + (size_t) r * nbh * 16, g + (size_t) F * nbh * 16 + (size_t) r * nbh,
-                               up + (size_t) r * nbh * 16, up + (size_t) F * nbh * 16 + (size_t) r * nbh, xq, xd, nbh,
-                               &gv, &uv);
-                act[i] = swiglu_oai(gv + job.gate_b[r], uv + job.up_b[r]);
+                rows2_cols_n(nc, gm + (size_t) r * nbh * 16, gm + (size_t) F * nbh * 16 + (size_t) r * nbh,
+                             up + (size_t) r * nbh * 16, up + (size_t) F * nbh * 16 + (size_t) r * nbh, xq, xd, nbh,
+                             gv, uv);
+                for (int c = 0; c < nc; ++c) act[c][i] = swiglu_oai(gv[c] + j0.gate_b[r], uv[c] + j0.up_b[r]);
             }
-            quant_q8(act, s.aq.data() + (size_t) j * F + rb * 32, s.ad.data() + (size_t) j * nbf + rb, 32);
+            for (int c = 0; c < nc; ++c) {
+                const int j = order[g0[g] + c];
+                quant_q8(act[c], s.aq.data() + (size_t) j * F + rb * 32, s.ad.data() + (size_t) j * nbf + rb, 32);
+            }
         }
         pool.barrier();
+        float v0[8], v1[8];
         for (;;) {
             const int u = next2.fetch_add(1, std::memory_order_relaxed);
             if (u >= u2) break;
-            const int j = u / (H / 32), rb = u % (H / 32);
-            const MissJob& job = jobs[j];
-            const uint8_t* d = job.blob + down_off;
-            const int8_t* aq = s.aq.data() + (size_t) j * F;
-            const float* ad = s.ad.data() + (size_t) j * nbf;
-            float* z = s.z.data() + (size_t) j * H;
+            const int g = u / (H / 32), rb = u % (H / 32);
+            const int nc = g0[g + 1] - g0[g];
+            const MissJob& j0 = jobs[order[g0[g]]];
+            for (int c = 0; c < nc; ++c) {
+                const int j = order[g0[g] + c];
+                xq[c] = s.aq.data() + (size_t) j * F;
+                xd[c] = s.ad.data() + (size_t) j * nbf;
+            }
+            const uint8_t* d = j0.blob + down_off;
             for (int i = 0; i < 32; i += 2) {
                 const int r = rb * 32 + i;
-                float v0, v1;
-                mxfp4_row_dot2(d + (size_t) r * nbf * 16, d + (size_t) H * nbf * 16 + (size_t) r * nbf,
-                               d + (size_t) (r + 1) * nbf * 16, d + (size_t) H * nbf * 16 + (size_t) (r + 1) * nbf, aq,
-                               ad, nbf, &v0, &v1);
-                z[r] = job.w * (v0 + job.down_b[r]);
-                z[r + 1] = job.w * (v1 + job.down_b[r + 1]);
+                rows2_cols_n(nc, d + (size_t) r * nbf * 16, d + (size_t) H * nbf * 16 + (size_t) r * nbf,
+                             d + (size_t) (r + 1) * nbf * 16, d + (size_t) H * nbf * 16 + (size_t) (r + 1) * nbf, xq, xd,
+                             nbf, v0, v1);
+                for (int c = 0; c < nc; ++c) {
+                    const MissJob& jb = jobs[order[g0[g] + c]];
+                    float* z = s.z.data() + (size_t) order[g0[g] + c] * H;
+                    z[r] = jb.w * (v0[c] + j0.down_b[r]);
+                    z[r + 1] = jb.w * (v1[c] + j0.down_b[r + 1]);
+                }
             }
         }
     };
     pool.run(fn);
-    // the sum per column, in job order (deterministic)
+    // the sum per column, in job order (deterministic, as before grouping)
     std::vector<char> seen(64, 0);
     for (int j = 0; j < nj; ++j) {
         float* yc = y + (size_t) jobs[j].col * y_stride;

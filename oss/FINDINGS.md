@@ -280,3 +280,28 @@ activations differ a little more from f16 than f16 does from itself).
 | 1,005 tokens | 1,406 tok/s | 1,809 tok/s |
 | 16,000 | 1,929 | 2,712 |
 | 32,000 | 1,723 | 2,328 |
+
+## 17. Final numbers, and the EAGLE3 prompt cost
+
+The draft has to read every prompt token (its KV rows for (token p + 1, g(p))). Done 8 rows at a time on the decode
+kernels, that cost ~2 s at 16K: prompts with EAGLE3 loaded ran 20-28% slower. Now long runs go through the prompt
+kernels in 512-row pieces (int8 WMMA projections, the tiled attention, which learned "no sinks"): 16K 2,002 -> 2,462,
+32K 1,683 -> 2,113 tok/s; output unchanged. The remaining ~9% vs no draft is the 75 expert slots the draft takes and
+what is left of the catch-up.
+
+**gpt-oss-120b, final build** (Ryzen 7 9800X3D, 30 GB DDR5, RX 9070 XT 16 GB + R9700 32 GB, ROCm 7.2; greedy, low
+reasoning effort, the saved profile, 300 generated tokens; llama.cpp = the best fitting hybrid split,
+`-ngl 99 -ncmoe 10 -ts 17/19 -fa on -lm none`, `llama-bench`):
+
+| | llama.cpp | strata-oss | strata-oss + EAGLE3 |
+| --- | ---: | ---: | ---: |
+| output, prose | 50.5 (tg128) | 100.9 | 116.4 |
+| output, code | - | 91.3 | 116.1 |
+| output after a 1K-token prompt | - | 96.3 | 130.6 |
+| output at 16K / 32K context | - | 82.1 / 72.7 | 94.4 / 83.6 |
+| prompt 1K tokens | 791 (pp512) | 1,808 | 1,624 |
+| prompt 16K / 32K tokens | - | 2,705 / 2,325 | 2,462 / 2,113 |
+
+Not measured: llama.cpp at 16K / 32K on this PC, other GPUs (the kernels are gfx120x-tuned; the WMMA paths need
+gfx1200/1201, the rest falls back), CUDA (the engine is HIP-only), Windows, gpt-oss-20b with EAGLE3 (its draft
+model's target layers differ), the server under several clients (it serves one answer at a time).

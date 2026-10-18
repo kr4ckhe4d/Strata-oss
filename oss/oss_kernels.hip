@@ -640,7 +640,7 @@ __global__ void __launch_bounds__(kQT) k_attn_prompt(const float* __restrict__ q
     const float* qp = qkv + (size_t) (active ? qi : 0) * (nh + 2 * nkv) * kHD + h * kHD;
 #pragma unroll
     for (int d = 0; d < kHD; ++d) { q[d] = qp[d] * scale; acc[d] = 0.f; }
-    float m = sinks[h], l = 1.f;  // the sink: exp(sink - m) in the denominator, no value
+    float m = sinks ? sinks[h] : -INFINITY, l = sinks ? 1.f : 0.f;  // the sink: exp(sink - m) in the denominator
     for (int t0 = blo; t0 <= bhi; t0 += kKT) {
         __syncthreads();
         // load the tile: 64 keys x 64 dims of K and V
@@ -950,9 +950,9 @@ __global__ void __launch_bounds__(128) k_attn_prompt_wmma(const float* __restric
 #pragma unroll
     for (int dt = 0; dt < kHD / 16; ++dt) o[dt] = f8v{};
     float m[8], l[8];
-    const float sink = sinks[h];
+    const float sink = sinks ? sinks[h] : -INFINITY;  // no sinks: the EAGLE3 draft
 #pragma unroll
-    for (int i = 0; i < 8; ++i) { m[i] = sink; l[i] = 1.f; }
+    for (int i = 0; i < 8; ++i) { m[i] = sink; l[i] = sinks ? 1.f : 0.f; }
     const int first_q = blockIdx.x * kWQ, last_q = min(ntok, first_q + kWQ) - 1;
     const int blo = window > 0 ? max(0, pos0 + first_q - window + 1) : 0;
     const int bhi = pos0 + last_q;
@@ -1012,7 +1012,7 @@ __global__ void __launch_bounds__(128) k_attn_prompt_wmma(const float* __restric
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const float mn = fmaxf(m[i], tmax[i]);
-            alpha[i] = __expf(m[i] - mn);
+            alpha[i] = mn == -INFINITY ? 1.f : __expf(m[i] - mn);  // nothing seen yet (no sink): nothing to rescale
             m[i] = mn;
         }
         float rs[8];

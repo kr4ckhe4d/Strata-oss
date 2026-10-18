@@ -182,6 +182,12 @@ struct Eagle {
     int8_t *catq = nullptr, *aoq = nullptr, *hq = nullptr, *actq = nullptr, *gq = nullptr;
     float *catd = nullptr, *aod = nullptr, *hd = nullptr, *actd = nullptr, *gqd = nullptr;
     int32_t* tok_d = nullptr;
+    // batched catch-up (prompt rows) through the prompt kernels, kCB rows at a time
+    static constexpr int kCB = 512;
+    float *b_g = nullptr, *b_cat = nullptr, *b_qkv = nullptr, *b_res = nullptr, *b_gu = nullptr, *b_act = nullptr,
+          *b_out = nullptr, *b_catd = nullptr, *b_hd = nullptr, *b_actd = nullptr, *b_aod = nullptr;
+    int8_t *b_catq = nullptr, *b_hq = nullptr, *b_actq = nullptr, *b_aoq = nullptr;
+    uint16_t* b_ao16 = nullptr;
     int n_valid = 0;  // draft KV rows [0, n_valid) hold (token p + 1, g(p))
     float last_p = 0.f;  // the draft model's probability of its last pick
     float p_min = 0.6f;  // drafting stops below this (OSS_DRAFT_PMIN)
@@ -858,6 +864,25 @@ struct Engine::Impl {
         e.gq = dalloc<int8_t>((size_t) MC * 3 * H);
         e.gqd = dalloc<float>((size_t) MC * 3 * H / 32);
         e.tok_d = dalloc<int32_t>(2);
+        {
+            const size_t B = Eagle::kCB;
+            e.b_g = dalloc<float>(B * H);
+            e.b_cat = dalloc<float>(B * e.IN);
+            e.b_catq = dalloc<int8_t>(B * e.IN);
+            e.b_catd = dalloc<float>(B * e.IN / 32);
+            e.b_qkv = dalloc<float>(B * e.R);
+            e.b_ao16 = dalloc<uint16_t>(B * hp.NH * hp.HD);
+            e.b_aoq = dalloc<int8_t>(B * hp.NH * hp.HD);
+            e.b_aod = dalloc<float>(B * hp.NH * hp.HD / 32);
+            e.b_res = dalloc<float>(B * H);
+            e.b_hq = dalloc<int8_t>(B * H);
+            e.b_hd = dalloc<float>(B * H / 32);
+            e.b_gu = dalloc<float>(B * 2 * e.FF);
+            e.b_act = dalloc<float>(B * e.FF);
+            e.b_actq = dalloc<int8_t>(B * e.FF);
+            e.b_actd = dalloc<float>(B * e.FF / 32);
+            e.b_out = dalloc<float>(B * H);
+        }
         if (const char* v = std::getenv("OSS_DRAFT_PMIN")) e.p_min = (float) std::atof(v);
         e.on = true;
         std::fprintf(stderr, "strata-oss: EAGLE3 draft %s on GPU %d (target layers %d, %d, %d; draft vocabulary %d)\n",
@@ -919,6 +944,38 @@ struct Engine::Impl {
         return t[0];
     }
 
+
+    // the draft decoder over n (<= kCB) consecutive real rows at positions pos0.. (catch-up for a prompt): the prompt
+    // kernels (int8 WMMA projections, tiled attention); xe = their embeddings, g = the ring rows of those positions
+    bool eagle_rows_batch(const float* xe, int pos0, int n) {
+        Eagle& e = eg;
+        Dev& d = devs.back();
+        const int H = hp.H, NA = hp.NH * hp.HD;
+        hipStream_t s = d.s;
+        // g rows (the ring may wrap once)
+        const int a = pos0 % e.G, n1 = std::min(n, e.G - a);
+        HIPCHECK(hipMemcpyAsync(e.b_g, e.gring + (size_t) a * H, sizeof(float) * n1 * H, hipMemcpyDeviceToDevice, s));
+        if (n1 < n)
+            HIPCHECK(hipMemcpyAsync(e.b_g + (size_t) n1 * H, e.gring, sizeof(float) * (n - n1) * H,
+                                    hipMemcpyDeviceToDevice, s));
+        rmsnorm_strided(xe, H, e.attn_norm, e.b_cat, e.IN, H, n, e.eps, s);
+        rmsnorm_strided(e.b_g, H, e.attn_norm2, e.b_cat + H, e.IN, H, n, e.eps, s);
+        quant_q8(e.b_cat, e.b_catq, e.b_catd, e.IN, n, s);
+        if (!dense_q8_wmma(e.qkv_q, e.qkv_d, e.b_catq, e.b_catd, nullptr, e.b_qkv, e.IN, e.R, n, false, s)) return false;
+        rope_store_prompt(e.b_qkv, e.kc, e.vc, pos0, hp.NH, hp.NKV, hp.HD, e.cap, e.rope, n, s);
+        attn_prompt(e.b_qkv, e.kc, e.vc, nullptr, pos0, e.b_ao16, hp.NH, hp.NKV, hp.HD, e.cap, 0, n, s);
+        quant_q8_f16(e.b_ao16, e.b_aoq, e.b_aod, NA, n, s);
+        HIPCHECK(hipMemcpyAsync(e.b_res, e.b_g, sizeof(float) * n * H, hipMemcpyDeviceToDevice, s));
+        dense_q8_wmma(e.o_q, e.o_d, e.b_aoq, e.b_aod, nullptr, e.b_res, NA, H, n, true, s);
+        rmsnorm_quant(e.b_res, e.ffn_norm, nullptr, e.b_hq, e.b_hd, H, n, e.eps, s);
+        dense_q8_wmma(e.gu_q, e.gu_d, e.b_hq, e.b_hd, nullptr, e.b_gu, H, 2 * e.FF, n, false, s);
+        silu_mul(e.b_gu, e.b_act, e.FF, n, s);
+        quant_q8(e.b_act, e.b_actq, e.b_actd, e.FF, n, s);
+        HIPCHECK(hipMemcpyAsync(e.b_out, e.b_res, sizeof(float) * n * H, hipMemcpyDeviceToDevice, s));
+        dense_q8_wmma(e.down_q, e.down_d, e.b_actq, e.b_actd, nullptr, e.b_out, e.FF, H, n, true, s);
+        return true;
+    }
+
     // rows (hist[p + 1], g(p)) for p in [n_valid, npast - 2]
     void eagle_catchup() {
         Eagle& e = eg;
@@ -933,7 +990,14 @@ struct Engine::Impl {
         for (int r = 0; r < p1 - p0; r += o.chunk) {
             const int n = std::min(o.chunk, p1 - p0 - r);
             HIPCHECK(hipMemcpyAsync(e.xe, emb.data() + (size_t) r * H, sizeof(float) * n * H, hipMemcpyHostToDevice, d.s));
-            for (int c = 0; c < n; c += kMaxCols) {
+            int c = 0;
+            // long runs through the prompt kernels (their rounding differs a little from the decode ones: the
+            // drafts change, the target's tokens do not)
+            for (; n - c > kMaxCols; c += Eagle::kCB) {
+                const int nb = std::min(Eagle::kCB, n - c);
+                if (!eagle_rows_batch(e.xe + (size_t) c * H, p0 + r + c, nb)) break;
+            }
+            for (; c < n; c += kMaxCols) {
                 const int nc = std::min(kMaxCols, n - c);
                 const float* gs[kMaxCols];
                 for (int j = 0; j < nc; ++j) gs[j] = e.gring + (size_t) ((p0 + r + c + j) % e.G) * H;

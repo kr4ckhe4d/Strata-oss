@@ -1272,6 +1272,16 @@ __global__ void k_argmax_map(const float* __restrict__ lg, int n, const int32_t*
     }
 }
 
+__global__ void k_f32_to_f16_2d(const float* __restrict__ src, int lds, uint16_t* __restrict__ dst, int ldd, int width) {
+    const int r = blockIdx.y;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < width; i += gridDim.x * blockDim.x)
+        dst[(size_t) r * ldd + i] = f2h(src[(size_t) r * lds + i]);
+}
+__global__ void k_f16_to_f32(const uint16_t* __restrict__ src, float* __restrict__ dst, size_t n) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = h2f(src[i]);
+}
+
 unsigned cdiv(size_t a, size_t b) { return (unsigned) ((a + b - 1) / b); }
 
 } // namespace
@@ -1505,6 +1515,15 @@ bool dense_q8_wmma(const int8_t* wq, const uint16_t* wd, const int8_t* xq, const
                        (const uint8_t* const*) nullptr, (const int4*) nullptr, ntok, xq, xd, bias, (const float*) nullptr,
                        y, n_in, n_out, (size_t) 0, (size_t) 0, wq, wd, accumulate);
     return true;
+}
+
+void f32_to_f16_2d(const float* src, int lds, uint16_t* dst, int ldd, int width, int rows, hipStream_t s) {
+    if (rows <= 0) return;
+    hipLaunchKernelGGL(k_f32_to_f16_2d, dim3(cdiv(width, 256), rows), dim3(256), 0, s, src, lds, dst, ldd, width);
+}
+
+void f16_to_f32(const uint16_t* src, float* dst, size_t n, hipStream_t s) {
+    hipLaunchKernelGGL(k_f16_to_f32, dim3(cdiv(n, 256)), dim3(256), 0, s, src, dst, n);
 }
 
 } // namespace oss

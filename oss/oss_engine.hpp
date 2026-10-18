@@ -26,6 +26,7 @@ struct Options {
     bool verbose = false;
     std::string draft_model;         // an EAGLE3 GGUF (eagle3-gpt-oss-120b): speculative drafts from it
     std::string draft_vocab;         // its reduced vocabulary (oss/draft_vocab.txt); empty: the full one
+    int draft_window = 4096;         // the draft attends to its last N positions (a KV ring); 0: the whole context
 };
 
 struct Stats {

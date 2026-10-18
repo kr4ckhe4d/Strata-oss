@@ -183,7 +183,9 @@ struct Eagle {
     float *catd = nullptr, *aod = nullptr, *hd = nullptr, *actd = nullptr, *gqd = nullptr;
     int32_t* tok_d = nullptr;
     // batched catch-up (prompt rows) through the prompt kernels, kCB rows at a time
-    static constexpr int kCB = 512;
+    int cb = 256;   // rows per batched catch-up piece (OSS_EAGLE_CB)
+    int win = 0;    // attention window of the draft (0: all positions)
+    uint16_t* pfeat16 = nullptr;  // the prompt chunk's features, f16
     float *b_g = nullptr, *b_cat = nullptr, *b_qkv = nullptr, *b_res = nullptr, *b_gu = nullptr, *b_act = nullptr,
           *b_out = nullptr, *b_catd = nullptr, *b_hd = nullptr, *b_actd = nullptr, *b_aod = nullptr;
     int8_t *b_catq = nullptr, *b_hq = nullptr, *b_actq = nullptr, *b_aoq = nullptr;
@@ -833,17 +835,20 @@ struct Engine::Impl {
             e.head_d = dupload(dd.data(), dd.size());
             e.map_d = dupload(ids.data(), ids.size());
         }
-        e.cap = o.ctx;
+        e.win = o.draft_window > 0 && o.draft_window < o.ctx ? o.draft_window : 0;
+        if (const char* v = std::getenv("OSS_EAGLE_CB")) e.cb = std::max(16, std::atoi(v));
+        // a window keeps a ring: the window plus the most rows one call writes
+        e.cap = e.win ? std::min(o.ctx, e.win + std::max(e.cb, o.chunk) + 16) : o.ctx;
         e.kc = dalloc<uint16_t>((size_t) e.cap * hp.NKV * hp.HD);
         e.vc = dalloc<uint16_t>((size_t) e.cap * hp.NKV * hp.HD);
         const int MC = kMaxCols;
         e.feat = dalloc<float>((size_t) MC * 3 * H);
-        e.pfeat = dalloc<float>((size_t) o.chunk * 3 * H);
+        e.pfeat16 = dalloc<uint16_t>((size_t) o.chunk * 3 * H);
         e.G = o.chunk + 64;
         e.gring = dalloc<float>((size_t) e.G * H);
         e.gtmp = dalloc<float>((size_t) MC * H);
         e.params = dalloc<StepParams>(1);
-        e.xe = dalloc<float>((size_t) (o.chunk + MC) * H);
+        e.xe = dalloc<float>((size_t) (e.cb + MC) * H);
         e.gin = dalloc<float>((size_t) MC * H);
         e.cat = dalloc<float>((size_t) MC * e.IN);
         e.qkv = dalloc<float>((size_t) MC * e.R);
@@ -865,7 +870,8 @@ struct Engine::Impl {
         e.gqd = dalloc<float>((size_t) MC * 3 * H / 32);
         e.tok_d = dalloc<int32_t>(2);
         {
-            const size_t B = Eagle::kCB;
+            if (const char* v = std::getenv("OSS_EAGLE_CB")) e.cb = std::max(16, std::atoi(v));
+            const size_t B = e.cb;
             e.b_g = dalloc<float>(B * H);
             e.b_cat = dalloc<float>(B * e.IN);
             e.b_catq = dalloc<int8_t>(B * e.IN);
@@ -904,6 +910,18 @@ struct Engine::Impl {
         }
     }
 
+    // the same from the prompt's f16 features, 8 rows at a time through the f32 decode buffer
+    void eagle_g16(const uint16_t* feat16, int n, int pos0) {
+        Eagle& e = eg;
+        Dev& d = devs.back();
+        const int H = hp.H;
+        for (int r = 0; r < n; r += kMaxCols) {
+            const int nc = std::min(kMaxCols, n - r);
+            f16_to_f32(feat16 + (size_t) r * 3 * H, e.feat, (size_t) nc * 3 * H, d.s);
+            eagle_g(e.feat, nc, pos0 + r);
+        }
+    }
+
     // the draft decoder over nc rows: embeddings xe (device, nc x H), g inputs (device pointers), positions pos0..
     // Returns the argmax (target id) of the last row when want, else -1.  e.out holds the rows' prenorm states.
     int eagle_rows(const float* xe, const float* const* gsrc, int pos0, int nc, bool want) {
@@ -922,7 +940,7 @@ struct Engine::Impl {
         quant_q8(e.cat, e.catq, e.catd, e.IN, nc, s);
         mv_q8_0(e.qkv_q, e.qkv_d, e.catq, e.catd, nullptr, e.qkv, e.IN, e.R, nc, false, s);
         rope_store(e.qkv, e.kc, e.vc, e.params, hp.NH, hp.NKV, hp.HD, e.cap, e.rope, nc, s);
-        attn_decode(e.qkv, e.kc, e.vc, nullptr, e.params, d.attn_part, e.ao, hp.NH, hp.NKV, hp.HD, e.cap, 0, o.ctx, nc,
+        attn_decode(e.qkv, e.kc, e.vc, nullptr, e.params, d.attn_part, e.ao, hp.NH, hp.NKV, hp.HD, e.cap, e.win, o.ctx, nc,
                     s);
         quant_q8(e.ao, e.aoq, e.aod, NA, nc, s);
         HIPCHECK(hipMemcpyAsync(e.res, e.gin, sizeof(float) * nc * H, hipMemcpyDeviceToDevice, s));
@@ -963,7 +981,7 @@ struct Engine::Impl {
         quant_q8(e.b_cat, e.b_catq, e.b_catd, e.IN, n, s);
         if (!dense_q8_wmma(e.qkv_q, e.qkv_d, e.b_catq, e.b_catd, nullptr, e.b_qkv, e.IN, e.R, n, false, s)) return false;
         rope_store_prompt(e.b_qkv, e.kc, e.vc, pos0, hp.NH, hp.NKV, hp.HD, e.cap, e.rope, n, s);
-        attn_prompt(e.b_qkv, e.kc, e.vc, nullptr, pos0, e.b_ao16, hp.NH, hp.NKV, hp.HD, e.cap, 0, n, s);
+        attn_prompt(e.b_qkv, e.kc, e.vc, nullptr, pos0, e.b_ao16, hp.NH, hp.NKV, hp.HD, e.cap, e.win, n, s);
         quant_q8_f16(e.b_ao16, e.b_aoq, e.b_aod, NA, n, s);
         HIPCHECK(hipMemcpyAsync(e.b_res, e.b_g, sizeof(float) * n * H, hipMemcpyDeviceToDevice, s));
         dense_q8_wmma(e.o_q, e.o_d, e.b_aoq, e.b_aod, nullptr, e.b_res, NA, H, n, true, s);
@@ -987,14 +1005,14 @@ struct Engine::Impl {
         HIPCHECK(hipSetDevice(d.id));
         std::vector<float> emb((size_t) (p1 - p0) * H);
         embed(hist.data() + p0 + 1, p1 - p0, emb.data());
-        for (int r = 0; r < p1 - p0; r += o.chunk) {
-            const int n = std::min(o.chunk, p1 - p0 - r);
+        for (int r = 0; r < p1 - p0; r += e.cb) {
+            const int n = std::min(e.cb, p1 - p0 - r);
             HIPCHECK(hipMemcpyAsync(e.xe, emb.data() + (size_t) r * H, sizeof(float) * n * H, hipMemcpyHostToDevice, d.s));
             int c = 0;
             // long runs through the prompt kernels (their rounding differs a little from the decode ones: the
             // drafts change, the target's tokens do not)
-            for (; n - c > kMaxCols; c += Eagle::kCB) {
-                const int nb = std::min(Eagle::kCB, n - c);
+            for (; n - c > kMaxCols; c += e.cb) {
+                const int nb = std::min(e.cb, n - c);
                 if (!eagle_rows_batch(e.xe + (size_t) c * H, p0 + r + c, nb)) break;
             }
             for (; c < n; c += kMaxCols) {
@@ -1022,7 +1040,7 @@ struct Engine::Impl {
         const float* g = e.gring + (size_t) ((npast - 1) % e.G) * H;
         for (int i = 0; i < k; ++i) {
             const int pos = npast - 1 + i;
-            if (pos + 1 >= e.cap) break;
+            if (pos + 1 >= o.ctx) break;
             std::vector<float> emb(H);
             embed(&tok, 1, emb.data());
             HIPCHECK(hipMemcpyAsync(e.xe, emb.data(), sizeof(float) * H, hipMemcpyHostToDevice, d.s));
@@ -1393,8 +1411,7 @@ struct Engine::Impl {
                 if (!lastd || !eg.on) return;
                 for (int k = 0; k < 3; ++k)
                     if (eg.tl[k] == l || (l == hp.L && eg.tl[k] >= hp.L))
-                        HIPCHECK(hipMemcpy2DAsync(eg.pfeat + (size_t) k * H, sizeof(float) * 3 * H, d.px,
-                                                  sizeof(float) * H, sizeof(float) * H, ntok, hipMemcpyDeviceToDevice, d.s));
+                        f32_to_f16_2d(d.px, H, eg.pfeat16 + (size_t) k * H, 3 * H, H, ntok, d.s);
             };
             for (int l = d.l0; l < d.l1; ++l) {
                 take(l);
@@ -1417,7 +1434,7 @@ struct Engine::Impl {
             HIPCHECK(hipStreamSynchronize(d.s));
             if (want_all) all_logits.insert(all_logits.end(), logits_h, logits_h + (size_t) nc * hp.V);
         }
-        if (eg.on) eagle_g(eg.pfeat, ntok, npast);
+        if (eg.on) eagle_g16(eg.pfeat16, ntok, npast);
         npast += ntok;
     }
 

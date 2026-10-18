@@ -144,4 +144,7 @@ void quant_q8_f16(const uint16_t* x, int8_t* q, float* d, int n, int nvec, hipSt
 bool dense_q8_wmma(const int8_t* wq, const uint16_t* wd, const int8_t* xq, const float* xd, const float* bias, float* y,
                    int n_in, int n_out, int ntok, bool accumulate, hipStream_t s);
 
+void f32_to_f16_2d(const float* src, int lds, uint16_t* dst, int ldd, int width, int rows, hipStream_t s);
+void f16_to_f32(const uint16_t* src, float* dst, size_t n, hipStream_t s);
+
 } // namespace oss

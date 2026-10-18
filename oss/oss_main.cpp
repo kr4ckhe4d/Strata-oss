@@ -206,6 +206,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-spec") spec = false;
         else if (a == "--draft-model") o.draft_model = next();
         else if (a == "--draft-vocab") o.draft_vocab = next();
+        else if (a == "--draft-window") o.draft_window = std::atoi(next().c_str());
         else if (a == "--draft-max") draft_max = std::atoi(next().c_str());
         else if (a == "-v") o.verbose = true;
         else { usage(); return 2; }

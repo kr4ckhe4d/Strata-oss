@@ -322,3 +322,22 @@ the single-column kernel's exactly, so results are bitwise unchanged: 20b with h
 On the 120b with the matured profile (97% hits) few CPU experts are shared, so the gain is small: an 8-token verify
 step 26.64 -> 25.70 ms, EAGLE3 prose 116.4 -> 117.5, code 116.1 -> 119.5 tok/s. It matters for a smaller GPU (more
 experts on the CPU) and for batching several conversations.
+
+## 19. A smaller EAGLE3 footprint
+
+Where the draft's ~0.9 GB went (64K context, 4K chunks): weights ~370 MB (fixed), its full-context KV cache 134 MB,
+the prompt chunk's features in f32 142 MB, the batched catch-up scratch 160 MB (512 rows), the catch-up embeddings 47
+MB, the g ring 48 MB. Changes:
+- prompt features stored f16 (the taps convert on the way, 71 MB less), catch-up embeddings uploaded per piece
+  (3 MB instead of 47), catch-up pieces of 256 rows (`OSS_EAGLE_CB`, same prompt speed as 512: 2,475 vs 2,479 tok/s);
+- `--draft-window N` (default 4,096): the draft attends to its last N positions, its KV cache a ring. At 16K context:
+  window 0 / 8,192 / 4,096 / 2,048 -> 1.83 / 1.81 / 1.82 / 1.76 tokens a step, output 95.3 / 95.1 / 96.8 / 94.8 tok/s.
+  The saving grows with the context (134 MB at 64K, 268 MB at 128K).
+- A bug the window exposed: drafting stopped at position `e.cap` (meant as the context bound), which a ring makes
+  small: with an 8K window no drafts at all past position 12,304. Now bounded by the context.
+
+| 120b, 64K context | expert slots |
+| --- | ---: |
+| no draft | 3,169 |
+| draft, before (f32 features, 512-row scratch, full KV) | ~3,094 (75 fewer) |
+| draft, now (f16 features, 256 rows, window 4,096) | 3,122 (47 fewer) |

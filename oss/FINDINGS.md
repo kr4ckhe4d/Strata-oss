@@ -92,3 +92,23 @@ output projection 87 ms, attention 72 ms, router 9 ms.
   these shapes.
 - Next lever when prompt speed matters again: own WMMA kernels (`__builtin_amdgcn_wmma_*_gfx12`) for the dense
   projections and for the expert tiles (int8 WMMA instead of dp4a), and a WMMA attention for long prompts.
+
+## 8. The server (oss/server.py) on 120b
+
+Standard library only; `strata-oss --serve` underneath (JSON lines). Checked with curl:
+- plain chat (`reasoning_content` from the analysis channel, `content` from final), streaming SSE, `/v1/completions`;
+- a client disconnect cancels the answer (the engine stops generating);
+- tool calls: the model's `to=functions.get_weather` message comes back as `tool_calls`, `finish_reason: tool_calls`;
+  sending the tool result back gives the final answer (137 of 188 prompt tokens reused from the cache);
+- prefix reuse across turns (`usage.prompt_tokens_details.cached_tokens`).
+
+| prompt | prompt tok/s | output tok/s | experts hit in VRAM |
+| --- | ---: | ---: | ---: |
+| ~80 tokens (chat turns) | 235-265 | 72-81 | 89-92% |
+| 12,864 tokens (5 chunks of 2,048 + rest) | 913 | 67-70 | 95-97% |
+
+- Long prompts slow down because `k_attn_prompt` (a thread per query, 207 VGPRs, spills) grows with the context; the
+  full-attention layers dominate there. Output at 13K context is 67 tok/s vs ~80 at short context: the decode
+  attention reduces each key across a wave (5 shuffles a key). Both are the next kernels to rewrite.
+- Short prompts are dominated by fixed per-layer costs (the router sync, dequant of the dense weights to f16 for
+  hipBLAS): 80 tokens take 0.3-0.4 s.

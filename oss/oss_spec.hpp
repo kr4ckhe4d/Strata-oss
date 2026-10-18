@@ -132,6 +132,9 @@ public:
         const int V = eng_.n_vocab();
         pending_ = smp_.pick(last, V);
     }
+    /// Batched decoding (several conversations a step): the token to evaluate next, then its logits.
+    int32_t pending() const { return pending_; }
+    void advance(const float* logits) { pending_ = smp_.pick(logits, eng_.n_vocab()); }
     /// The next tokens of the answer (at least one).  The first call returns the token sampled by begin().
     /// `stop`: tokens that end the answer (nothing is evaluated past them).
     std::vector<int32_t> next(const std::vector<int32_t>& stop) {

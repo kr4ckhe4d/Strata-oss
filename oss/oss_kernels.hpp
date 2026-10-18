@@ -29,6 +29,7 @@ struct StepParams {
     int ncols = 1;
     uint32_t seq = 0;            // step counter, the flags below compare against it
     int pos[kMaxCols] = {};
+    int slot[kMaxCols] = {};     // each column's conversation: its KV region is kv + slot * kv_stride
 };
 
 /// One layer's mailbox between a GPU and the host, in page-locked (coherent) host memory.
@@ -73,13 +74,13 @@ void mv_f32(const float* w, const float* x, const float* bias, float* y, int n_i
 // ---- decode attention block pieces
 // qkv[c] = [q (nh*hd) | k (nkv*hd) | v (nkv*hd)]; ropes q and k in place and stores k, v (f16) at slot pos % cap
 void rope_store(float* qkv, uint16_t* kc, uint16_t* vc, const StepParams* p, int nh, int nkv, int hd, int cap,
-                RopeParams rp, int ncols, hipStream_t s);
+                RopeParams rp, int ncols, hipStream_t s, size_t kv_stride = 0);
 // attention over the cache for the decode columns; window = 0 for full attention.  part = scratch from
 // attn_part_floats(), out[c] = nh*hd floats
 size_t attn_part_floats(int nh, int max_ctx, int ncols);
 void attn_decode(const float* qkv, const uint16_t* kc, const uint16_t* vc, const float* sinks, const StepParams* p,
                  float* part, float* out, int nh, int nkv, int hd, int cap, int window, int max_ctx, int ncols,
-                 hipStream_t s);
+                 hipStream_t s, size_t kv_stride = 0);
 
 // ---- MoE (decode).  topk/topw: device copies [ncols][K]; slot_of: [n_expert] for this layer (-1 = not in VRAM)
 void router_topk(const float* logits, int n_expert, int ncols, int32_t* topk, float* topw, hipStream_t s);

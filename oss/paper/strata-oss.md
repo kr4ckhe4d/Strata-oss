@@ -69,6 +69,7 @@ computes the cached ones, and keeps adapting the ranking to the conversation.
    49,152-token draft vocabulary and confidence stopping. Greedy output is token-identical (§3.6).
 5. A measurement methodology for a model whose own reference implementation disagrees with itself on 7% of tokens
    (§4.1), and an account of the bottlenecks and pitfalls (§5, §6).
+6. Batched serving of several conversations in one decode step, token-identical to serving them alone (§7).
 
 ---
 
@@ -443,19 +444,36 @@ add ~4 ms; the original attention kernel added ~11 ms.
 
 ---
 
-## 7. Limitations and future work
+## 7. Addressed limits, and the ones that remain
 
-- **One answer at a time.** The engine holds one conversation in its KV cache; concurrent requests queue.
-- **HIP / RDNA4 only.** The WMMA kernels are gfx1200/1201 only (gfx11's fragment layout differs). Other AMD GPUs fall
-  back to dp4a and hipBLAS, untested. The engine has no CUDA build.
-- **The EAGLE3 draft costs VRAM**: 0.9 GB is 75 fewer expert slots, and prompts run ~9% slower with it loaded.
+The first version served one conversation at a time, recomputed a CPU expert once per column of a verify window,
+and let the EAGLE3 draft cost 75 expert slots. All three were addressed after the evaluation above (FINDINGS.md
+§18-20):
+
+- **Several conversations at once (`--parallel N`).** Each conversation slot has its own KV region; the step
+  parameters carry every column's slot and the attention and KV kernels offset by it. One decode step serves up to 8
+  conversations, and the dense weights and attention are read once for all of them. Four conversations generated
+  together are token-identical to each generated alone. Total throughput is 148.8 tokens/s for 2 conversations
+  (1.5×), 191.3 for 4 (2.0×) and 258.2 for 8 (2.9×, with repeated prompts). Each slot's KV cache at 16K context costs
+  ~68 expert slots.
+- **CPU misses grouped across a verify window.** The jobs are grouped by expert, and a 2-row × 1-8-column kernel
+  decodes each weight block once for all the columns that routed to it. Per column the accumulation order is
+  unchanged, so results are bitwise identical (493 of 493 positions). With half of the 20b's experts on the CPU,
+  8-token windows run 128.9 → 186.3 tokens/s (+45%); with the 120b's matured profile the gain is ~3%.
+- **A smaller draft.** Prompt features are stored in f16, the catch-up uses 256-row pieces, and the draft attends to
+  its last 4,096 positions through a KV ring, with acceptance unchanged at 16K context (1.82 vs. 1.83 tokens per
+  step). The draft now costs 47 expert slots instead of 75. The ring exposed a bug: drafting had stopped at the
+  cache's capacity rather than at the context bound.
+
+**Remaining:**
+
+- **HIP / RDNA4 only.** The WMMA kernels are gfx1200/1201 only (gfx11's fragment layout differs); other AMD GPUs
+  fall back to dp4a and hipBLAS, untested. The engine has no CUDA build. These are not addressed because the
+  hardware to build and validate them is not available here.
+- **A new prompt pauses the other conversations** while it is read; batched steps use no drafts.
 - **PCIe bounds long prompts.** Ideas: keep a prompt's most-used missing experts resident across chunks, let the CPU
   compute the coldest experts of short prompts (Strata's "prompt CPU share"), and compress streamed experts.
-- **Verify cost on code** is higher than on prose. Grouping a window's columns by expert on the CPU would read each
-  missed expert once per window instead of once per column.
 - **Not measured:** llama.cpp at 16K/32K on this PC, gpt-oss-20b with EAGLE3, Windows, other machines.
-
----
 
 ## 8. Reproducing
 

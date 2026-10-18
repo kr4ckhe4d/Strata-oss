@@ -1,12 +1,13 @@
 """strata-oss server: an OpenAI-compatible API for gpt-oss on the strata-oss engine.
 
     python oss/server.py --model gpt-oss-120b-MXFP4.gguf [--port 8096] [--host 127.0.0.1] [--api-key KEY]
-                         [-- extra engine args, e.g. --ctx 65536 --profile oss120.prof]
+                         [-- extra engine args, e.g. --ctx 65536 --profile oss120.prof --parallel 4]
 
 Standard library only.  Endpoints: GET /v1/models, POST /v1/chat/completions (stream or not; `reasoning_content` for
 the analysis channel, `tool_calls` for functions.* calls; `reasoning_effort` low|medium|high), POST /v1/completions
-(raw prompt), GET /health.  One answer at a time (the engine holds one conversation in its KV cache and reuses the
-longest common prefix of the next prompt); requests queue.  A client that disconnects cancels its answer.
+(raw prompt), GET /health.  Up to --parallel answers at once (engine flag; each conversation slot has its own KV
+cache, and a new request goes to the free slot sharing the longest prefix with it); more requests queue.  A client
+that disconnects cancels its answer.
 
 Never expose it beyond 127.0.0.1 without --api-key.
 """
@@ -33,47 +34,65 @@ STOP_IDS = [RETURN, CALL, 199999]
 
 
 class Engine:
-    """The strata-oss --serve process: JSON lines in, JSON lines out."""
+    """The strata-oss --serve process: JSON lines in, JSON lines out, several answers at once (--parallel)."""
 
     def __init__(self, binary: str, model: str, extra: list[str]):
         cmd = [binary, "--model", model, "--serve"] + extra
         print("strata-oss server: starting", " ".join(cmd), file=sys.stderr, flush=True)
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
-        self.lock = threading.Lock()
-        self.events: queue.Queue = queue.Queue()
+        self.wlock = threading.Lock()
+        self.qlock = threading.Lock()
+        self.queues: dict[str, queue.Queue] = {}
+        self.ready: queue.Queue = queue.Queue()
         threading.Thread(target=self._read, daemon=True).start()
-        ev = self.events.get()
+        ev = self.ready.get()
         if ev.get("type") != "ready":
             raise RuntimeError("engine did not start: %r" % ev)
         self.n_ctx = ev["n_ctx"]
+        self.parallel = ev.get("parallel", 1)
 
     def _read(self):
         for line in self.p.stdout:
             line = line.strip()
-            if line.startswith("{"):
-                try:
-                    self.events.put(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
-        self.events.put({"type": "exit"})
+            if not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rid = ev.get("rid")
+            if rid is None:
+                self.ready.put(ev)
+                continue
+            with self.qlock:
+                q = self.queues.get(rid)
+            if q:
+                q.put(ev)
+        with self.qlock:
+            for q in self.queues.values():
+                q.put({"type": "exit"})
+        self.ready.put({"type": "exit"})
 
     def send(self, obj):
-        self.p.stdin.write(json.dumps(obj) + "\n")
-        self.p.stdin.flush()
+        with self.wlock:
+            self.p.stdin.write(json.dumps(obj) + "\n")
+            self.p.stdin.flush()
 
     def generate(self, tokens, params, cancelled):
         """Yields token ids, then the final 'done' event (a dict)."""
-        with self.lock:
-            while not self.events.empty():
-                self.events.get_nowait()
-            self.send(dict(params, op="generate", tokens=tokens))
+        rid = uuid.uuid4().hex
+        q: queue.Queue = queue.Queue()
+        with self.qlock:
+            self.queues[rid] = q
+        try:
+            self.send(dict(params, op="generate", rid=rid, tokens=tokens))
             sent_cancel = False
             while True:
                 if cancelled() and not sent_cancel:
-                    self.send({"op": "cancel"})
+                    self.send({"op": "cancel", "rid": rid})
                     sent_cancel = True
                 try:
-                    ev = self.events.get(timeout=0.2)
+                    ev = q.get(timeout=0.2)
                 except queue.Empty:
                     continue
                 t = ev.get("type")
@@ -82,6 +101,9 @@ class Engine:
                 elif t in ("done", "error", "exit"):
                     yield ev
                     return
+        finally:
+            with self.qlock:
+                self.queues.pop(rid, None)
 
 
 class Harmony:
@@ -340,14 +362,15 @@ def main():
     name = a.name or pathlib.Path(a.model).stem
     signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(eng, tk, name, a.api_key, a.reasoning))
-    print(f"strata-oss server: http://{a.host}:{a.port}/v1 ({name}, context {eng.n_ctx})", file=sys.stderr, flush=True)
+    print(f"strata-oss server: http://{a.host}:{a.port}/v1 ({name}, context {eng.n_ctx}, {eng.parallel} at once)",
+          file=sys.stderr, flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         try:
-            eng.send({"op": "save_profile"})
+            eng.send({"op": "save_profile", "rid": "_"})
             eng.p.stdin.close()
             eng.p.wait(timeout=30)
         except Exception:

@@ -203,6 +203,8 @@ int main(int argc, char** argv) {
         else if (a == "--dump-logits") { dump = next(); mode = "dump"; }
         else if (a == "--serve") mode = "serve";
         else if (a == "--bench-verify") mode = "verify";
+        else if (a == "--bench-parallel") mode = "parallel";
+        else if (a == "--parallel") o.parallel = std::atoi(next().c_str());
         else if (a == "--no-spec") spec = false;
         else if (a == "--draft-model") o.draft_model = next();
         else if (a == "--draft-vocab") o.draft_vocab = next();
@@ -222,6 +224,60 @@ int main(int argc, char** argv) {
             FILE* f = std::fopen(dump.c_str(), "wb");
             std::fwrite(lg, sizeof(float), ids.size() * (size_t) V, f);
             std::fclose(f);
+            eng.report(stderr);
+            return 0;
+        }
+        if (mode == "parallel") {
+            // --tokens a,b,c: generate n-predict greedy tokens for every prompt at once, then each alone; compare
+            std::vector<std::vector<int32_t>> prompts;
+            {
+                std::stringstream ss(tokens_file);
+                std::string f;
+                while (std::getline(ss, f, ',')) prompts.push_back(read_ids(f));
+            }
+            const int n = (int) prompts.size();
+            if (n > eng.n_seqs()) { std::fprintf(stderr, "--parallel %d < %d prompts\n", eng.n_seqs(), n); return 2; }
+            eng.set_busy(true);
+            std::vector<std::vector<int32_t>> together(n), alone(n);
+            std::vector<int32_t> pend(n);
+            for (int i = 0; i < n; ++i) {
+                eng.select(i);
+                const float* lg = eng.eval(prompts[i]);
+                pend[i] = (int32_t) (std::max_element(lg, lg + V) - lg);
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            std::vector<int> slots(n);
+            for (int i = 0; i < n; ++i) slots[i] = i;
+            for (int k = 0; k < n_predict; ++k) {
+                for (int i = 0; i < n; ++i) together[i].push_back(pend[i]);
+                const float* lg = eng.step_multi(slots, pend);
+                for (int i = 0; i < n; ++i)
+                    pend[i] = (int32_t) (std::max_element(lg + (size_t) i * V, lg + (size_t) (i + 1) * V) - (lg + (size_t) i * V));
+            }
+            const double tt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            std::fprintf(stderr, "strata-oss: %d conversations x %d tokens together: %.2f s, %.1f tok/s in total (%.1f each)\n",
+                         n, n_predict, tt, n * n_predict / tt, n_predict / tt);
+            double ta = 0;
+            for (int i = 0; i < n; ++i) {
+                eng.select(i);
+                eng.reuse_prefix({});  // read the prompt again the same way (the prompt path rounds differently)
+                const float* lg = eng.eval(prompts[i]);
+                const auto t1 = std::chrono::steady_clock::now();
+                int32_t t = (int32_t) (std::max_element(lg, lg + V) - lg);
+                for (int k = 0; k < n_predict; ++k) {
+                    alone[i].push_back(t);
+                    lg = eng.eval({t});
+                    t = (int32_t) (std::max_element(lg, lg + V) - lg);
+                }
+                ta += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+            }
+            std::fprintf(stderr, "strata-oss: the same one at a time: %.2f s, %.1f tok/s\n", ta, n * n_predict / ta);
+            for (int i = 0; i < n; ++i) {
+                int same = 0;
+                while (same < n_predict && together[i][same] == alone[i][same]) ++same;
+                std::fprintf(stderr, "strata-oss: conversation %d: %s (first %d of %d tokens equal)\n", i,
+                             same == n_predict ? "same tokens" : "DIFFERENT", same, n_predict);
+            }
             eng.report(stderr);
             return 0;
         }
@@ -290,15 +346,15 @@ int main(int argc, char** argv) {
             eng.report(stderr);
             return 0;
         }
-        // ---- serve: one request at a time; a reader thread so a "cancel" can arrive mid-answer
+        // ---- serve: up to --parallel answers at once.  A reader thread queues the requests; the loop reads one new
+        // prompt at a time, then advances every answer: alone with speculation, together in one batched step.
         std::deque<std::string> q;
         std::mutex mu;
         std::condition_variable cv;
-        std::atomic<bool> cancel{false}, eof{false};
+        std::atomic<bool> eof{false};
         std::thread reader([&] {
             std::string line;
             while (std::getline(std::cin, line)) {
-                if (line.find("\"cancel\"") != std::string::npos) { cancel.store(true); continue; }
                 std::lock_guard<std::mutex> lk(mu);
                 q.push_back(line);
                 cv.notify_one();
@@ -309,99 +365,189 @@ int main(int argc, char** argv) {
         reader.detach();
         {
             std::ostringstream ss;
-            ss << "{\"type\":\"ready\",\"n_vocab\":" << V << ",\"n_ctx\":" << eng.n_ctx() << "}";
+            ss << "{\"type\":\"ready\",\"n_vocab\":" << V << ",\"n_ctx\":" << eng.n_ctx()
+               << ",\"parallel\":" << eng.n_seqs() << "}";
             emit(ss.str());
         }
+        struct Req {
+            std::string rid;
+            std::vector<int32_t> toks, stops;
+            Sampler smp;
+            std::unique_ptr<oss::Generator> gen;
+            int slot = -1, max_tokens = 512, n_gen = 0, reused = 0;
+            bool started = false, cancel = false, spec = true;
+            std::chrono::steady_clock::time_point t0;
+            double t_prompt = 0;
+        };
+        std::vector<std::unique_ptr<Req>> active, waiting;
+        std::vector<char> slot_busy((size_t) eng.n_seqs(), 0);
+        auto jstr = [](const std::string& x) {
+            std::string r = "\"";
+            for (char c : x) { if (c == '"' || c == '\\') r += '\\'; r += c; }
+            return r + "\"";
+        };
+        auto finish = [&](Req& r, const std::string& reason) {
+            const double tt = std::chrono::duration<double>(std::chrono::steady_clock::now() - r.t0).count();
+            std::ostringstream ss;
+            ss << "{\"type\":\"done\",\"rid\":" << jstr(r.rid) << ",\"reason\":\"" << reason << "\",\"n_gen\":"
+               << r.n_gen << ",\"n_prompt\":" << r.toks.size() << ",\"n_reused\":" << r.reused
+               << ",\"t_prompt\":" << r.t_prompt << ",\"t_gen\":" << (tt - r.t_prompt)
+               << ",\"steps\":" << (r.gen ? r.gen->st.steps : 0) << "}";
+            emit(ss.str());
+            if (r.slot >= 0) slot_busy[(size_t) r.slot] = 0;
+            r.slot = -1;
+        };
+        // emits t; true when the answer ends with it
+        auto give = [&](Req& r, int32_t t, std::string& reason) {
+            ++r.n_gen;
+            std::ostringstream ss;
+            ss << "{\"type\":\"token\",\"rid\":" << jstr(r.rid) << ",\"id\":" << t << "}";
+            emit(ss.str());
+            if (std::find(r.stops.begin(), r.stops.end(), t) != r.stops.end()) { reason = "stop"; return true; }
+            if (r.n_gen >= r.max_tokens) { reason = "length"; return true; }
+            return false;
+        };
         for (;;) {
-            std::string line;
+            // 1. take requests
             {
                 std::unique_lock<std::mutex> lk(mu);
-                cv.wait(lk, [&] { return !q.empty() || eof.load(); });
-                if (q.empty()) break;
-                line = q.front();
-                q.pop_front();
+                if (active.empty() && waiting.empty())
+                    cv.wait(lk, [&] { return !q.empty() || eof.load(); });
+                if (q.empty() && eof.load() && active.empty() && waiting.empty()) break;
+                while (!q.empty()) {
+                    const std::string line = q.front();
+                    q.pop_front();
+                    lk.unlock();
+                    J req;
+                    bool ok = true;
+                    try { req = parse(line); } catch (std::exception&) { ok = false; }
+                    if (!ok) { emit("{\"type\":\"error\",\"error\":\"bad json\"}"); lk.lock(); continue; }
+                    const std::string op = req.str("op", "generate");
+                    const std::string rid = req.str("rid", "0");
+                    if (op == "cancel") {
+                        for (auto& r : active) if (r->rid == rid) r->cancel = true;
+                        for (auto& r : waiting) if (r->rid == rid) r->cancel = true;
+                    } else if (op == "stats") {
+                        eng.report(stderr);
+                        emit("{\"type\":\"stats\"}");
+                    } else if (op == "save_profile") {
+                        eng.save_profile();
+                        emit("{\"type\":\"saved\"}");
+                    } else {
+                        auto r = std::make_unique<Req>();
+                        r->rid = rid;
+                        r->toks = ints(req.get("tokens"));
+                        r->stops = ints(req.get("stop"));
+                        r->max_tokens = (int) req.num("max_tokens", 512);
+                        r->smp.temp = req.num("temperature", 0);
+                        r->smp.top_p = req.num("top_p", 1);
+                        r->smp.top_k = (int) req.num("top_k", 0);
+                        r->smp.min_p = req.num("min_p", 0);
+                        r->smp.rng.seed((uint64_t) req.num("seed", (double) std::random_device{}()));
+                        r->spec = spec && !req.get("no_spec");
+                        r->t0 = std::chrono::steady_clock::now();
+                        if (r->toks.empty() || (int) r->toks.size() >= eng.n_ctx()) {
+                            emit("{\"type\":\"error\",\"rid\":" + jstr(rid) + ",\"error\":\"" +
+                                 (r->toks.empty() ? "no tokens" : "prompt longer than the context") + "\"}");
+                        } else {
+                            waiting.push_back(std::move(r));
+                        }
+                    }
+                    lk.lock();
+                }
             }
-            J req;
-            try { req = parse(line); } catch (std::exception& e) {
-                emit(std::string("{\"type\":\"error\",\"error\":\"bad json\"}"));
-                continue;
-            }
-            const std::string op = req.str("op", "generate");
-            if (op == "stats") {
-                eng.report(stderr);
-                emit("{\"type\":\"stats\"}");
-                continue;
-            }
-            if (op == "save_profile") { eng.save_profile(); emit("{\"type\":\"saved\"}"); continue; }
-            auto toks = ints(req.get("tokens"));
-            if (toks.empty()) { emit("{\"type\":\"error\",\"error\":\"no tokens\"}"); continue; }
-            if ((int) toks.size() >= eng.n_ctx()) {
-                emit("{\"type\":\"error\",\"error\":\"prompt longer than the context\"}");
-                continue;
-            }
-            cancel.store(false);
-            Sampler smp;
-            smp.temp = req.num("temperature", 0);
-            smp.top_p = req.num("top_p", 1);
-            smp.top_k = (int) req.num("top_k", 0);
-            smp.min_p = req.num("min_p", 0);
-            smp.rng.seed((uint64_t) req.num("seed", (double) std::random_device{}()));
-            const int max_tokens = (int) req.num("max_tokens", 512);
-            auto stops = ints(req.get("stop"));
             eng.set_busy(true);
-            const auto t0 = std::chrono::steady_clock::now();
-            const int reused = eng.reuse_prefix(toks);
-            std::vector<int32_t> rest(toks.begin() + reused, toks.end());
-            {
-                std::ostringstream ss;
-                ss << "{\"type\":\"start\",\"n_prompt\":" << toks.size() << ",\"n_reused\":" << reused << "}";
-                emit(ss.str());
-            }
-            const float* lg = nullptr;
-            std::string reason = "length";
-            int n_gen = 0;
-            uint64_t spec_steps = 0;
-            double t_prompt = 0;
-            try {
-                lg = eng.eval(rest);
-                const auto t1 = std::chrono::steady_clock::now();
-                t_prompt = std::chrono::duration<double>(t1 - t0).count();
-                oss::Generator gen(eng, smp);
-                gen.spec = spec && !req.get("no_spec");
-                gen.max_draft = draft_max;
-                gen.begin(lg);
-                bool end = false;
-                while (!end && n_gen < max_tokens) {
-                    if (cancel.load()) { reason = "cancel"; break; }
-                    if (eng.n_past() + 2 >= eng.n_ctx()) { reason = "context"; break; }
-                    auto toks = gen.next(stops);
-                    for (int t : toks) {
-                        ++n_gen;
-                        std::ostringstream ss;
-                        ss << "{\"type\":\"token\",\"id\":" << t << "}";
-                        emit(ss.str());
-                        if (std::find(stops.begin(), stops.end(), t) != stops.end()) { reason = "stop"; end = true; break; }
-                        if (n_gen >= max_tokens) break;
+            // 2. cancelled answers
+            for (auto& r : waiting) if (r->cancel) finish(*r, "cancel");
+            waiting.erase(std::remove_if(waiting.begin(), waiting.end(), [](auto& r) { return r->cancel; }), waiting.end());
+            for (auto& r : active) if (r->cancel && r->slot >= 0) finish(*r, "cancel");
+            active.erase(std::remove_if(active.begin(), active.end(), [](auto& r) { return r->slot < 0; }), active.end());
+            // 3. one new prompt: the free slot whose conversation shares the longest prefix with it
+            if (!waiting.empty()) {
+                int best = -1;
+                size_t best_n = 0;
+                for (int sl = 0; sl < eng.n_seqs(); ++sl) {
+                    if (slot_busy[(size_t) sl]) continue;
+                    eng.select(sl);
+                    const auto& h = eng.history();
+                    size_t n = 0;
+                    while (n < h.size() && n < waiting.front()->toks.size() && h[n] == waiting.front()->toks[n]) ++n;
+                    if (best < 0 || n > best_n) { best = sl; best_n = n; }
+                }
+                if (best >= 0) {
+                    auto r = std::move(waiting.front());
+                    waiting.erase(waiting.begin());
+                    r->slot = best;
+                    slot_busy[(size_t) best] = 1;
+                    eng.select(best);
+                    try {
+                        r->reused = eng.reuse_prefix(r->toks);
+                        std::vector<int32_t> rest(r->toks.begin() + r->reused, r->toks.end());
+                        {
+                            std::ostringstream ss;
+                            ss << "{\"type\":\"start\",\"rid\":" << jstr(r->rid) << ",\"n_prompt\":" << r->toks.size()
+                               << ",\"n_reused\":" << r->reused << ",\"slot\":" << best << "}";
+                            emit(ss.str());
+                        }
+                        const float* lg = eng.eval(rest);
+                        r->t_prompt = std::chrono::duration<double>(std::chrono::steady_clock::now() - r->t0).count();
+                        r->gen = std::make_unique<oss::Generator>(eng, r->smp);
+                        r->gen->spec = r->spec;
+                        r->gen->max_draft = draft_max;
+                        r->gen->begin(lg);
+                        active.push_back(std::move(r));
+                    } catch (std::exception& e) {
+                        emit("{\"type\":\"error\",\"rid\":" + jstr(r->rid) + ",\"error\":" + jstr(e.what()) + "}");
+                        eng.reuse_prefix({});
+                        slot_busy[(size_t) best] = 0;
                     }
                 }
-                spec_steps = gen.st.steps;
-            } catch (std::exception& e) {
-                std::ostringstream ss;
-                ss << "{\"type\":\"error\",\"error\":\"" << e.what() << "\"}";
-                emit(ss.str());
-                eng.reuse_prefix({});
-                eng.set_busy(false);
-                continue;
             }
-            const auto t2 = std::chrono::steady_clock::now();
-            const double tt = std::chrono::duration<double>(t2 - t0).count();
-            eng.set_busy(false);
-            std::ostringstream ss;
-            ss << "{\"type\":\"done\",\"reason\":\"" << reason << "\",\"n_gen\":" << n_gen
-               << ",\"n_prompt\":" << toks.size() << ",\"n_reused\":" << reused << ",\"t_prompt\":" << t_prompt
-               << ",\"t_gen\":" << (tt - t_prompt) << ",\"steps\":" << spec_steps << "}";
-            emit(ss.str());
-            eng.report(stderr);
+            // 4. advance the answers
+            try {
+                if (active.size() == 1) {
+                    Req& r = *active[0];
+                    eng.select(r.slot);
+                    std::string reason;
+                    bool end = false;
+                    if (eng.n_past() + 2 >= eng.n_ctx()) { reason = "context"; end = true; }
+                    else
+                        for (int t : r.gen->next(r.stops))
+                            if (give(r, t, reason)) { end = true; break; }
+                    if (end) finish(r, reason);
+                } else if (active.size() > 1) {
+                    std::vector<int> slots;
+                    std::vector<int32_t> toks;
+                    std::vector<Req*> who;
+                    for (auto& rp : active) {
+                        Req& r = *rp;
+                        std::string reason;
+                        eng.select(r.slot);
+                        if (give(r, r.gen->pending(), reason)) { finish(r, reason); continue; }
+                        if (eng.n_past() + 2 >= eng.n_ctx()) { finish(r, "context"); continue; }
+                        if ((int) slots.size() < 8) {  // the engine's columns a step
+                            slots.push_back(r.slot);
+                            toks.push_back(r.gen->pending());
+                            who.push_back(&r);
+                        }
+                    }
+                    if (!slots.empty()) {
+                        const float* lg = eng.step_multi(slots, toks);
+                        for (size_t c = 0; c < who.size(); ++c) who[c]->gen->advance(lg + c * (size_t) V);
+                    }
+                }
+            } catch (std::exception& e) {
+                for (auto& r : active) {
+                    emit("{\"type\":\"error\",\"rid\":" + jstr(r->rid) + ",\"error\":" + jstr(e.what()) + "}");
+                    if (r->slot >= 0) { eng.select(r->slot); eng.reuse_prefix({}); slot_busy[(size_t) r->slot] = 0; }
+                    r->slot = -1;
+                }
+            }
+            active.erase(std::remove_if(active.begin(), active.end(), [](auto& r) { return r->slot < 0; }), active.end());
+            if (active.empty() && waiting.empty()) {
+                eng.set_busy(false);
+                eng.report(stderr);
+            }
         }
         return 0;
     } catch (std::exception& e) {

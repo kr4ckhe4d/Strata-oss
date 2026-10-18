@@ -341,3 +341,30 @@ MB, the g ring 48 MB. Changes:
 | no draft | 3,169 |
 | draft, before (f32 features, 512-row scratch, full KV) | ~3,094 (75 fewer) |
 | draft, now (f16 features, 256 rows, window 4,096) | 3,122 (47 fewer) |
+
+## 20. Several conversations at once (`--parallel N`)
+
+Each conversation slot has its own KV region on every layer (and its own EAGLE3 draft KV ring and g ring); the step
+parameters carry each column's slot, and the attention / KV kernels offset by it. One decode step then serves up to 8
+conversations, one column each, with everything else unchanged: the dense weights and attention read once for all
+columns, the experts per column (the CPU's grouped by expert, section 18). The scheduler (`--serve`) reads one new
+prompt at a time (it pauses the others while it reads), then advances every answer: alone with speculation (prompt
+lookup, EAGLE3), together in one batched step without drafts. A new request takes the free slot sharing the longest
+prefix with it. The HTTP server routes the engine's messages by request id.
+
+Exactness: `--bench-parallel` generates for N prompts together, then each alone (same placement, adaptation off).
+4 different prompts (prose, code, a code edit, a 1K document), 200 greedy tokens each: **all 4 token-identical**.
+(A first version of the check differed because the "alone" pass re-read only the last prompt token through the
+decode path, which rounds differently from the prompt path; reading the whole prompt again fixed the check.)
+
+| 120b, 16K context per slot, greedy, 200 tokens each | total tok/s | each | vs one at a time | expert slots |
+| --- | ---: | ---: | ---: | ---: |
+| 1 (the same prompts one after another) | 88-99 | - | 1.0x | - |
+| 2 conversations | 148.8 | 74.4 | 1.5x | 3,244 |
+| 4 | 191.3 | 47.8 | 2.0x | 3,108 |
+| 8 (the 4 prompts twice: more expert sharing than 8 users) | 258.2 | 32.3 | 2.9x | 2,833 |
+
+- Each slot's KV cache at 16K costs ~68 expert slots, so choose `--parallel` and `--ctx` together.
+- Through the HTTP server (`-- --parallel 4`, EAGLE3 loaded): 4 simultaneous chat requests all answered correctly;
+  a lone request still gets EAGLE3 drafts.
+- Not done: reading a new prompt while others decode (it blocks them for its duration), drafts in batched steps.

@@ -40,12 +40,15 @@ hf download ggml-org/gpt-oss-120b-GGUF eagle3-gpt-oss-120b-Q8_0.gguf --local-dir
 ```
 
 `http://127.0.0.1:8096/v1`: `/chat/completions` (streaming, `reasoning_content`, `tool_calls`, `reasoning_effort`),
-`/completions`, `/models`. One answer at a time; the next prompt's common prefix is reused from the KV cache. Never
-listen beyond 127.0.0.1 without `--api-key`. Engine flags go after `--`:
+`/completions`, `/models`. Up to `--parallel` answers at once (batched into one decode step); a new request reuses
+the KV cache of the free conversation slot that shares the longest prefix with it. Never listen beyond 127.0.0.1
+without `--api-key`. Engine flags go after `--`:
 
 | flag | default | |
 | --- | --- | --- |
-| `--ctx N` | 32768 | context (the model's maximum is 131072) |
+| `--ctx N` | 32768 | context per conversation (the model's maximum is 131072) |
+| `--parallel N` | 1 | conversations at once (1-8); each has its own KV cache: ~68 expert slots per 16K of context |
+| `--draft-window N` | 4096 | the EAGLE3 draft's attention window (0: the whole context) |
 | `--chunk N` | 4096 | prompt chunk; 8192 is faster for long documents but takes expert slots |
 | `--profile FILE` | none | read the expert profile at start, write the learned one at exit; first start is slower |
 | `--gpus 0,1` / `--split 12,24` | all / by free VRAM | which GPUs, and how many layers each |
@@ -53,13 +56,15 @@ listen beyond 127.0.0.1 without `--api-key`. Engine flags go after `--`:
 | `--adapt-every N` | 16 | decode steps between expert swap rounds (0: off) |
 
 Environment switches (all measured in FINDINGS.md): `OSS_ATTN_WMMA=0`, `OSS_MMQ_WMMA=0`, `OSS_DENSE_WMMA=0` (the
-older kernels), `OSS_DRAFT_PMIN` (EAGLE3's confidence cut, 0.6), `OSS_PROF=1` (prompt-path timings).
+older kernels), `OSS_GROUP_MISSES=0` (one CPU job per column), `OSS_DRAFT_PMIN` (EAGLE3's confidence cut, 0.6),
+`OSS_EAGLE_CB` (catch-up rows a piece, 256), `OSS_PROF=1` (prompt-path timings).
 
 ## Command line
 
 ```bash
 build-oss/strata-oss --model gpt-oss-120b-MXFP4.gguf --tokens ids.txt --n-predict 256   # greedy, prints ids
 build-oss/strata-oss --model gpt-oss-120b-MXFP4.gguf --tokens ids.txt --bench-verify    # the cost of a verify step
+build-oss/strata-oss --model gpt-oss-120b-MXFP4.gguf --parallel 4 --tokens a.txt,b.txt,c.txt,d.txt --bench-parallel
 build-oss/strata-oss --model gpt-oss-20b-mxfp4.gguf --tokens ids.txt --dump-logits out.bin
 ```
 

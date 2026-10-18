@@ -227,9 +227,10 @@ __device__ __forceinline__ void yarn_cs(float pos, int i0, const RopeParams& rp,
 // grid (nh + nkv, ncols), block hd/2 threads: one rotation pair each; k and v are stored as f16
 __global__ void k_rope_store(float* __restrict__ qkv, uint16_t* __restrict__ kc, uint16_t* __restrict__ vc,
                              const StepParams* __restrict__ p, int pos0, int nh, int nkv, int hd, int cap,
-                             RopeParams rp) {
+                             RopeParams rp, size_t kv_stride) {
     const int head = blockIdx.x, c = blockIdx.y, i = threadIdx.x;
     const int pos = p ? p->pos[c] : pos0 + c;
+    if (p) { kc += (size_t) p->slot[c] * kv_stride; vc += (size_t) p->slot[c] * kv_stride; }
     const int stride = (nh + 2 * nkv) * hd;
     float* row = qkv + (size_t) c * stride;
     float* v = row + head * hd;  // q heads, then k heads
@@ -264,7 +265,7 @@ constexpr int kHD = 64;       // head dim (checked at load)
 __global__ void __launch_bounds__(256) k_attn_split(const float* __restrict__ qkv, const uint16_t* __restrict__ kc,
                                                     const uint16_t* __restrict__ vc, const StepParams* __restrict__ p,
                                                     float* __restrict__ part, int nh, int nkv, int cap, int window,
-                                                    int max_splits) {
+                                                    int max_splits, size_t kv_stride) {
     constexpr int KP = kHD + 2;  // padded row, halves
     __shared__ uint16_t Ks[kSplit * KP];
     __shared__ uint16_t Vs[kSplit * kHD];
@@ -274,6 +275,8 @@ __global__ void __launch_bounds__(256) k_attn_split(const float* __restrict__ qk
     const int w = threadIdx.x / WS, lane = threadIdx.x % WS;
     const int h = kvh * g + w;
     const int pos = p->pos[c];
+    kc += (size_t) p->slot[c] * kv_stride;
+    vc += (size_t) p->slot[c] * kv_stride;
     const int lo = window > 0 ? max(0, pos - window + 1) : 0;
     const int t0 = lo + sp * kSplit;
     if (t0 > pos) return;
@@ -1324,14 +1327,15 @@ void mv_f32(const float* w, const float* x, const float* bias, float* y, int n_i
 }
 
 void rope_store(float* qkv, uint16_t* kc, uint16_t* vc, const StepParams* p, int nh, int nkv, int hd, int cap,
-                RopeParams rp, int ncols, hipStream_t s) {
-    hipLaunchKernelGGL(k_rope_store, dim3(nh + nkv, ncols), dim3(hd / 2), 0, s, qkv, kc, vc, p, 0, nh, nkv, hd, cap, rp);
+                RopeParams rp, int ncols, hipStream_t s, size_t kv_stride) {
+    hipLaunchKernelGGL(k_rope_store, dim3(nh + nkv, ncols), dim3(hd / 2), 0, s, qkv, kc, vc, p, 0, nh, nkv, hd, cap, rp,
+                       kv_stride);
 }
 
 void rope_store_prompt(float* qkv, uint16_t* kc, uint16_t* vc, int pos0, int nh, int nkv, int hd, int cap,
                        RopeParams rp, int ntok, hipStream_t s) {
     hipLaunchKernelGGL(k_rope_store, dim3(nh + nkv, ntok), dim3(hd / 2), 0, s, qkv, kc, vc, (const StepParams*) nullptr,
-                       pos0, nh, nkv, hd, cap, rp);
+                       pos0, nh, nkv, hd, cap, rp, (size_t) 0);
 }
 
 size_t attn_part_floats(int nh, int max_ctx, int ncols) {
@@ -1341,13 +1345,13 @@ size_t attn_part_floats(int nh, int max_ctx, int ncols) {
 
 void attn_decode(const float* qkv, const uint16_t* kc, const uint16_t* vc, const float* sinks, const StepParams* p,
                  float* part, float* out, int nh, int nkv, int hd, int cap, int window, int max_ctx, int ncols,
-                 hipStream_t s) {
+                 hipStream_t s, size_t kv_stride) {
     (void) hd;
     const int span = window > 0 ? window : max_ctx;
     const int ms_layer = (span + kSplit - 1) / kSplit;
     const int ms = (max_ctx + kSplit - 1) / kSplit;  // the part buffer's stride
     hipLaunchKernelGGL(k_attn_split, dim3(nkv, ms_layer, ncols), dim3((nh / nkv) * WS), 0, s, qkv, kc, vc, p, part, nh,
-                       nkv, cap, window, ms);
+                       nkv, cap, window, ms, kv_stride);
     hipLaunchKernelGGL(k_attn_combine, dim3(nh, ncols), dim3(kHD), 0, s, part, sinks, p, out, nh, window, ms);
 }
 

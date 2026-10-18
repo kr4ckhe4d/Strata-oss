@@ -26,6 +26,7 @@ struct Options {
     bool verbose = false;
     std::string draft_model;         // an EAGLE3 GGUF (eagle3-gpt-oss-120b): speculative drafts from it
     std::string draft_vocab;         // its reduced vocabulary (oss/draft_vocab.txt); empty: the full one
+    int parallel = 1;                // conversations held at once (each gets its own KV cache of ctx positions)
     int draft_window = 4096;         // the draft attends to its last N positions (a KV ring); 0: the whole context
 };
 
@@ -59,6 +60,13 @@ public:
     int n_past() const;
     /// Drops the cache positions from n on (the rejected drafts of a verify window).
     void truncate(int n);
+    /// Conversation slots: every call above and below acts on the selected one (0 .. n_seqs() - 1).
+    int n_seqs() const;
+    void select(int seq);
+    int selected() const;
+    /// One decode step over several conversations: column c evaluates tokens[c] for slots[c] (one token each,
+    /// distinct slots, at most 8).  Returns the logits, [n][n_vocab].
+    const float* step_multi(const std::vector<int>& slots, const std::vector<int32_t>& tokens);
     /// EAGLE3: up to k draft tokens to follow `pending` (the target's next token, not yet evaluated).
     bool has_draft() const;
     int draft(int32_t pending, int k, std::vector<int32_t>& out);

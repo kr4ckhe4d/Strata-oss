@@ -114,6 +114,7 @@ struct DevLayer {
     float *gate_b = nullptr, *up_b = nullptr, *down_b = nullptr;
     uint16_t *kc = nullptr, *vc = nullptr;
     int cap = 0, window = 0;
+    size_t kv_stride = 0;  // elements between conversations' KV regions
     int32_t* slot_of = nullptr;
 };
 
@@ -190,16 +191,25 @@ struct Eagle {
           *b_out = nullptr, *b_catd = nullptr, *b_hd = nullptr, *b_actd = nullptr, *b_aod = nullptr;
     int8_t *b_catq = nullptr, *b_hq = nullptr, *b_actq = nullptr, *b_aoq = nullptr;
     uint16_t* b_ao16 = nullptr;
-    int n_valid = 0;  // draft KV rows [0, n_valid) hold (token p + 1, g(p))
+    size_t kv_stride = 0;  // per conversation: its draft KV region and its g ring (G x H floats)
     float last_p = 0.f;  // the draft model's probability of its last pick
     float p_min = 0.6f;  // drafting stops below this (OSS_DRAFT_PMIN)
     double t_draft = 0;
     uint64_t n_draft_steps = 0;
 };
 
+struct Seq {
+    std::vector<int32_t> hist;
+    int npast = 0;
+    int n_valid = 0;  // EAGLE3: draft KV rows [0, n_valid) hold (token p + 1, g(p))
+};
+
 struct Engine::Impl {
     Options o;
     Eagle eg;
+    std::vector<Seq> seqs;
+    int cur = 0;
+    Seq& S() { return seqs[(size_t) cur]; }
     std::unique_ptr<strata::GgufModel> gguf;
     Hp hp;
     std::vector<std::string> vocab;
@@ -225,8 +235,6 @@ struct Engine::Impl {
     std::unique_ptr<cpu::Pool> pool;
     cpu::MissScratch scratch;
     uint32_t seq = 0;
-    int npast = 0;
-    std::vector<int32_t> hist;
     std::vector<float> all_logits;
     Stats st;
     int steps_since_adapt = 0;
@@ -478,8 +486,9 @@ struct Engine::Impl {
             L.window = hp.is_swa(l) ? hp.swa : 0;
             L.cap = L.window ? std::min(o.ctx, hp.swa + std::max(o.swa_slack, o.chunk)) : o.ctx;
             const size_t kvn = (size_t) L.cap * hp.NKV * hp.HD;
-            L.kc = dalloc<uint16_t>(kvn);
-            L.vc = dalloc<uint16_t>(kvn);
+            L.kv_stride = kvn;
+            L.kc = dalloc<uint16_t>(kvn * o.parallel);
+            L.vc = dalloc<uint16_t>(kvn * o.parallel);
             L.slot_of = dalloc<int32_t>(E);
             d.layers.push_back(L);
         }
@@ -839,13 +848,14 @@ struct Engine::Impl {
         if (const char* v = std::getenv("OSS_EAGLE_CB")) e.cb = std::max(16, std::atoi(v));
         // a window keeps a ring: the window plus the most rows one call writes
         e.cap = e.win ? std::min(o.ctx, e.win + std::max(e.cb, o.chunk) + 16) : o.ctx;
-        e.kc = dalloc<uint16_t>((size_t) e.cap * hp.NKV * hp.HD);
-        e.vc = dalloc<uint16_t>((size_t) e.cap * hp.NKV * hp.HD);
+        e.kv_stride = (size_t) e.cap * hp.NKV * hp.HD;
+        e.kc = dalloc<uint16_t>(e.kv_stride * o.parallel);
+        e.vc = dalloc<uint16_t>(e.kv_stride * o.parallel);
         const int MC = kMaxCols;
         e.feat = dalloc<float>((size_t) MC * 3 * H);
         e.pfeat16 = dalloc<uint16_t>((size_t) o.chunk * 3 * H);
         e.G = o.chunk + 64;
-        e.gring = dalloc<float>((size_t) e.G * H);
+        e.gring = dalloc<float>((size_t) e.G * H * o.parallel);
         e.gtmp = dalloc<float>((size_t) MC * H);
         e.params = dalloc<StepParams>(1);
         e.xe = dalloc<float>((size_t) (e.cb + MC) * H);
@@ -895,8 +905,13 @@ struct Engine::Impl {
                      o.draft_model.c_str(), d.id, e.tl[0], e.tl[1], e.tl[2], e.NS);
     }
 
-    // g(p) = fc(norm(features(p))) for n rows of `feat` (3H floats each), positions pos0.. -> the ring
-    void eagle_g(const float* feat, int n, int pos0) {
+    float* gslot(int slot, int pos) { return eg.gring + ((size_t) slot * eg.G + (size_t) (pos % eg.G)) * hp.H; }
+    uint16_t* ekc() { return eg.kc + (size_t) cur * eg.kv_stride; }
+    uint16_t* evc() { return eg.vc + (size_t) cur * eg.kv_stride; }
+
+    // g(p) = fc(norm(features(p))) for n rows of `feat` (3H floats each) -> the rings: row j is slot slots[j] (or
+    // the selected one), position pos[j] (or pos0 + j)
+    void eagle_g(const float* feat, int n, int pos0, const int* slots = nullptr, const int* pos = nullptr) {
         Eagle& e = eg;
         Dev& d = devs.back();
         const int H = hp.H;
@@ -905,8 +920,8 @@ struct Engine::Impl {
             rmsnorm_quant(feat + (size_t) r * 3 * H, e.enc_norm, nullptr, e.gq, e.gqd, 3 * H, nc, e.eps, d.s);
             mv_q8_0(e.fc_q, e.fc_d, e.gq, e.gqd, nullptr, e.gtmp, 3 * H, H, nc, false, d.s);
             for (int j = 0; j < nc; ++j)
-                HIPCHECK(hipMemcpyAsync(e.gring + (size_t) ((pos0 + r + j) % e.G) * H, e.gtmp + (size_t) j * H,
-                                        sizeof(float) * H, hipMemcpyDeviceToDevice, d.s));
+                HIPCHECK(hipMemcpyAsync(gslot(slots ? slots[r + j] : cur, pos ? pos[r + j] : pos0 + r + j),
+                                        e.gtmp + (size_t) j * H, sizeof(float) * H, hipMemcpyDeviceToDevice, d.s));
         }
     }
 
@@ -939,9 +954,9 @@ struct Engine::Impl {
         rmsnorm_strided(e.gin, H, e.attn_norm2, e.cat + H, e.IN, H, nc, e.eps, s);
         quant_q8(e.cat, e.catq, e.catd, e.IN, nc, s);
         mv_q8_0(e.qkv_q, e.qkv_d, e.catq, e.catd, nullptr, e.qkv, e.IN, e.R, nc, false, s);
-        rope_store(e.qkv, e.kc, e.vc, e.params, hp.NH, hp.NKV, hp.HD, e.cap, e.rope, nc, s);
-        attn_decode(e.qkv, e.kc, e.vc, nullptr, e.params, d.attn_part, e.ao, hp.NH, hp.NKV, hp.HD, e.cap, e.win, o.ctx, nc,
-                    s);
+        rope_store(e.qkv, ekc(), evc(), e.params, hp.NH, hp.NKV, hp.HD, e.cap, e.rope, nc, s);
+        attn_decode(e.qkv, ekc(), evc(), nullptr, e.params, d.attn_part, e.ao, hp.NH, hp.NKV, hp.HD, e.cap, e.win, o.ctx,
+                    nc, s);
         quant_q8(e.ao, e.aoq, e.aod, NA, nc, s);
         HIPCHECK(hipMemcpyAsync(e.res, e.gin, sizeof(float) * nc * H, hipMemcpyDeviceToDevice, s));
         mv_q8_0(e.o_q, e.o_d, e.aoq, e.aod, nullptr, e.res, NA, H, nc, true, s);  // ffn_inp = attn + g
@@ -972,16 +987,16 @@ struct Engine::Impl {
         hipStream_t s = d.s;
         // g rows (the ring may wrap once)
         const int a = pos0 % e.G, n1 = std::min(n, e.G - a);
-        HIPCHECK(hipMemcpyAsync(e.b_g, e.gring + (size_t) a * H, sizeof(float) * n1 * H, hipMemcpyDeviceToDevice, s));
+        HIPCHECK(hipMemcpyAsync(e.b_g, gslot(cur, pos0), sizeof(float) * n1 * H, hipMemcpyDeviceToDevice, s));
         if (n1 < n)
-            HIPCHECK(hipMemcpyAsync(e.b_g + (size_t) n1 * H, e.gring, sizeof(float) * (n - n1) * H,
+            HIPCHECK(hipMemcpyAsync(e.b_g + (size_t) n1 * H, gslot(cur, pos0 + n1), sizeof(float) * (n - n1) * H,
                                     hipMemcpyDeviceToDevice, s));
         rmsnorm_strided(xe, H, e.attn_norm, e.b_cat, e.IN, H, n, e.eps, s);
         rmsnorm_strided(e.b_g, H, e.attn_norm2, e.b_cat + H, e.IN, H, n, e.eps, s);
         quant_q8(e.b_cat, e.b_catq, e.b_catd, e.IN, n, s);
         if (!dense_q8_wmma(e.qkv_q, e.qkv_d, e.b_catq, e.b_catd, nullptr, e.b_qkv, e.IN, e.R, n, false, s)) return false;
-        rope_store_prompt(e.b_qkv, e.kc, e.vc, pos0, hp.NH, hp.NKV, hp.HD, e.cap, e.rope, n, s);
-        attn_prompt(e.b_qkv, e.kc, e.vc, nullptr, pos0, e.b_ao16, hp.NH, hp.NKV, hp.HD, e.cap, e.win, n, s);
+        rope_store_prompt(e.b_qkv, ekc(), evc(), pos0, hp.NH, hp.NKV, hp.HD, e.cap, e.rope, n, s);
+        attn_prompt(e.b_qkv, ekc(), evc(), nullptr, pos0, e.b_ao16, hp.NH, hp.NKV, hp.HD, e.cap, e.win, n, s);
         quant_q8_f16(e.b_ao16, e.b_aoq, e.b_aod, NA, n, s);
         HIPCHECK(hipMemcpyAsync(e.b_res, e.b_g, sizeof(float) * n * H, hipMemcpyDeviceToDevice, s));
         dense_q8_wmma(e.o_q, e.o_d, e.b_aoq, e.b_aod, nullptr, e.b_res, NA, H, n, true, s);
@@ -999,12 +1014,12 @@ struct Engine::Impl {
         Eagle& e = eg;
         if (!e.on) return;
         const int H = hp.H;
-        const int p0 = e.n_valid, p1 = npast - 1;  // exclusive end
+        const int p0 = S().n_valid, p1 = S().npast - 1;  // exclusive end
         if (p1 <= p0) return;
         Dev& d = devs.back();
         HIPCHECK(hipSetDevice(d.id));
         std::vector<float> emb((size_t) (p1 - p0) * H);
-        embed(hist.data() + p0 + 1, p1 - p0, emb.data());
+        embed(S().hist.data() + p0 + 1, p1 - p0, emb.data());
         for (int r = 0; r < p1 - p0; r += e.cb) {
             const int n = std::min(e.cb, p1 - p0 - r);
             HIPCHECK(hipMemcpyAsync(e.xe, emb.data() + (size_t) r * H, sizeof(float) * n * H, hipMemcpyHostToDevice, d.s));
@@ -1018,17 +1033,18 @@ struct Engine::Impl {
             for (; c < n; c += kMaxCols) {
                 const int nc = std::min(kMaxCols, n - c);
                 const float* gs[kMaxCols];
-                for (int j = 0; j < nc; ++j) gs[j] = e.gring + (size_t) ((p0 + r + c + j) % e.G) * H;
+                for (int j = 0; j < nc; ++j) gs[j] = gslot(cur, p0 + r + c + j);
                 eagle_rows(e.xe + (size_t) c * H, gs, p0 + r + c, nc, false);
             }
             HIPCHECK(hipStreamSynchronize(d.s));
         }
-        e.n_valid = p1;
+        S().n_valid = p1;
     }
 
     int draft(int32_t pending, int k, std::vector<int32_t>& out) {
         out.clear();
         Eagle& e = eg;
+        const int npast = S().npast;
         if (!e.on || k <= 0 || npast < 1) return 0;
         const auto t0 = Clock::now();
         const int H = hp.H;
@@ -1037,7 +1053,7 @@ struct Engine::Impl {
         eagle_catchup();
         // the first row is a real one: (pending, g(npast - 1)); the next ones feed the draft's own prenorm state
         int32_t tok = pending;
-        const float* g = e.gring + (size_t) ((npast - 1) % e.G) * H;
+        const float* g = gslot(cur, npast - 1);
         for (int i = 0; i < k; ++i) {
             const int pos = npast - 1 + i;
             if (pos + 1 >= o.ctx) break;
@@ -1047,7 +1063,7 @@ struct Engine::Impl {
             const float* gs[1] = {g};
             tok = eagle_rows(e.xe, gs, pos, 1, true);
             ++e.n_draft_steps;
-            if (i == 0) e.n_valid = npast;
+            if (i == 0) S().n_valid = npast;
             if (e.last_p < e.p_min) break;  // not confident: checking it would likely be wasted
             out.push_back(tok);
             // the next row's g is this row's prenorm state: copy it aside (e.out is rewritten by the next row)
@@ -1080,9 +1096,9 @@ struct Engine::Impl {
             take(l);
             rmsnorm_quant(d.x, L.attn_norm, nullptr, d.xq, d.xd, H, nc, hp.eps, s);
             mv_q8_0(L.qkv_q, L.qkv_d, d.xq, d.xd, L.qkv_b, d.qkv, H, R, nc, false, s);
-            rope_store(d.qkv, L.kc, L.vc, d.params, hp.NH, hp.NKV, hp.HD, L.cap, hp.rope, nc, s);
+            rope_store(d.qkv, L.kc, L.vc, d.params, hp.NH, hp.NKV, hp.HD, L.cap, hp.rope, nc, s, L.kv_stride);
             attn_decode(d.qkv, L.kc, L.vc, L.sinks, d.params, d.attn_part, d.attn_out, hp.NH, hp.NKV, hp.HD, L.cap,
-                        L.window, o.ctx, nc, s);
+                        L.window, o.ctx, nc, s, L.kv_stride);
             quant_q8(d.attn_out, d.aoq, d.aod, NA, nc, s);
             mv_q8_0(L.o_q, L.o_d, d.aoq, d.aod, L.o_b, d.x, NA, H, nc, true, s);
             rmsnorm_quant(d.x, L.post_norm, d.h, d.hq, d.hd, H, nc, hp.eps, s);
@@ -1113,15 +1129,25 @@ struct Engine::Impl {
         HIPCHECK(hipGraphDestroy(g));
     }
 
-    const float* step(const int32_t* toks, int nc) {
+    // one decode step: column c is token toks[c] of conversation slots[c] (consecutive positions when a slot appears
+    // more than once: a verify window)
+    const float* step_cols(const int32_t* toks, const int* slots, int nc) {
         const int H = hp.H;
-        if (npast + nc > o.ctx) throw std::runtime_error("strata-oss: the context is full");
+        int pos[kMaxCols];
+        {
+            std::vector<int> used(seqs.size(), 0);
+            for (int c = 0; c < nc; ++c) {
+                Seq& q = seqs[(size_t) slots[c]];
+                pos[c] = q.npast + used[(size_t) slots[c]]++;
+                if (pos[c] + 1 > o.ctx) throw std::runtime_error("strata-oss: the context is full");
+            }
+        }
         for (size_t di = 0; di < devs.size(); ++di)
             if (!devs[di].graph[nc]) capture(devs[di], (int) di, nc);
         ++seq;
         params_h->ncols = nc;
         params_h->seq = seq;
-        for (int c = 0; c < nc; ++c) params_h->pos[c] = npast + c;
+        for (int c = 0; c < nc; ++c) { params_h->pos[c] = pos[c]; params_h->slot[c] = slots[c]; }
         embed(toks, nc, emb_h);
         for (auto& d : devs) {
             HIPCHECK(hipSetDevice(d.id));
@@ -1169,14 +1195,23 @@ struct Engine::Impl {
         }
         if (eg.on) {
             HIPCHECK(hipSetDevice(devs.back().id));
-            eagle_g(eg.feat, nc, npast);
+            eagle_g(eg.feat, nc, 0, slots, pos);
         }
-        npast += nc;
+        for (int c = 0; c < nc; ++c) {
+            Seq& q = seqs[(size_t) slots[c]];
+            q.npast = std::max(q.npast, pos[c] + 1);
+        }
         if (o.adapt_every > 0 && ++steps_since_adapt >= o.adapt_every) {
             steps_since_adapt = 0;
             adapt();
         }
         return logits_h;
+    }
+
+    const float* step(const int32_t* toks, int nc) {
+        int slots[kMaxCols];
+        for (int c = 0; c < nc; ++c) slots[c] = cur;
+        return step_cols(toks, slots, nc);
     }
 
     // ---------------------------------------------------------------- adaptive tier
@@ -1245,7 +1280,9 @@ struct Engine::Impl {
 
     void prompt_layer(Dev& d, int l, int ntok, int pos0) {
         const int H = hp.H, R = hp.qkv_rows(), NA = hp.NH * hp.HD, E = hp.E, F = hp.F;
-        DevLayer& L = d.layers[l - d.l0];
+        DevLayer L = d.layers[l - d.l0];  // a copy: its KV pointers move to the selected conversation's region
+        L.kc += (size_t) cur * L.kv_stride;
+        L.vc += (size_t) cur * L.kv_stride;
         HostLayer& h = hl[l];
         hipStream_t s = d.s;
         static const bool prof = std::getenv("OSS_PROF") != nullptr;
@@ -1396,6 +1433,7 @@ struct Engine::Impl {
 
     void prompt_chunk(const int32_t* toks, int ntok, bool want_all) {
         const int H = hp.H;
+        int& npast = S().npast;
         if (npast + ntok > o.ctx) throw std::runtime_error("strata-oss: the context is full");
         embed(toks, ntok, prompt_h);
         HIPCHECK(hipSetDevice(devs[0].id));
@@ -1450,12 +1488,12 @@ struct Engine::Impl {
             const int n = (int) std::min(toks.size() - i, (size_t) (prompt ? o.chunk : max_cols));
             if (n > kMaxCols) {
                 prompt_chunk(toks.data() + i, n, want_all);
-                hist.insert(hist.end(), toks.begin() + i, toks.begin() + i + n);
+                S().hist.insert(S().hist.end(), toks.begin() + i, toks.begin() + i + n);
                 eagle_catchup();  // before the next chunk reuses the g ring
                 last = logits_h;
             } else {
                 last = step(toks.data() + i, n);
-                hist.insert(hist.end(), toks.begin() + i, toks.begin() + i + n);
+                S().hist.insert(S().hist.end(), toks.begin() + i, toks.begin() + i + n);
                 if (want_all) all_logits.insert(all_logits.end(), last, last + (size_t) n * hp.V);
                 last += (size_t) (n - 1) * hp.V;
             }
@@ -1469,18 +1507,42 @@ struct Engine::Impl {
     }
 
     int reuse_prefix(const std::vector<int32_t>& toks) {
+        Seq& q = S();
         size_t n = 0;
-        while (n < toks.size() && n < hist.size() && toks[n] == hist[n]) ++n;
+        while (n < toks.size() && n < q.hist.size() && toks[n] == q.hist[n]) ++n;
         // keep at least one token to evaluate
         if (n == toks.size() && n > 0) --n;
         // a sliding-window layer's ring must still hold the window before n
         for (auto& d : devs)
             for (auto& L : d.layers)
-                if (L.window && n > 0 && (int64_t) n - L.window + L.cap < (int64_t) npast) n = 0;
-        hist.resize(n);
-        npast = (int) n;
-        eg.n_valid = std::min(eg.n_valid, std::max(0, (int) n - 1));
+                if (L.window && n > 0 && (int64_t) n - L.window + L.cap < (int64_t) q.npast) n = 0;
+        q.hist.resize(n);
+        q.npast = (int) n;
+        q.n_valid = std::min(q.n_valid, std::max(0, (int) n - 1));
         return (int) n;
+    }
+
+    // multi-conversation step: one token per slot; also keeps each slot's EAGLE3 rows from falling behind its ring
+    const float* step_multi(const std::vector<int>& slots, const std::vector<int32_t>& toks) {
+        const int nc = (int) slots.size();
+        if (nc < 1 || nc > kMaxCols) throw std::runtime_error("strata-oss: 1-8 conversations a step");
+        const auto t0 = Clock::now();
+        const float* lg = step_cols(toks.data(), slots.data(), nc);
+        for (int c = 0; c < nc; ++c) seqs[(size_t) slots[c]].hist.push_back(toks[c]);
+        st.t_decode += secs(t0, Clock::now());
+        st.n_decode += nc;
+        if (eg.on) {
+            const int keep = cur;
+            for (int c = 0; c < nc; ++c) {
+                Seq& q = seqs[(size_t) slots[c]];
+                if (q.npast - q.n_valid > eg.G / 2) {
+                    cur = slots[c];
+                    eagle_catchup();
+                }
+            }
+            cur = keep;
+        }
+        return lg;
     }
 
     void save_profile() const {
@@ -1508,6 +1570,8 @@ Engine::Engine(const Options& o) : p_(new Impl) {
                  "strata-oss: %s: %d layers, %d experts (top %d), %d heads / %d kv, window %d, vocab %d, ctx %d\n",
                  o.model.c_str(), m.hp.L, m.hp.E, m.hp.K, m.hp.NH, m.hp.NKV, m.hp.swa, m.hp.V, m.o.ctx);
     m.hl.resize(m.hp.L);
+    m.o.parallel = std::max(1, std::min(m.o.parallel, kMaxCols));
+    m.seqs.resize((size_t) m.o.parallel);
     m.choose_devices();
     for (size_t i = 0; i < m.devs.size(); ++i) m.alloc_device(m.devs[i], i + 1 == m.devs.size());
     m.alloc_host();
@@ -1531,17 +1595,27 @@ int Engine::eos() const { return p_->hp.eos; }
 const std::vector<std::string>& Engine::vocab() const { return p_->vocab; }
 int Engine::reuse_prefix(const std::vector<int32_t>& t) { return p_->reuse_prefix(t); }
 const float* Engine::eval(const std::vector<int32_t>& t, bool all) { return p_->eval(t, all); }
-int Engine::n_past() const { return p_->npast; }
+int Engine::n_past() const { return p_->seqs[(size_t) p_->cur].npast; }
 void Engine::truncate(int n) {
-    if (n < p_->npast) {
-        p_->npast = n;
-        p_->hist.resize(n);
-        p_->eg.n_valid = std::min(p_->eg.n_valid, std::max(0, n - 1));
+    Seq& q = p_->S();
+    if (n < q.npast) {
+        q.npast = n;
+        q.hist.resize(n);
+        q.n_valid = std::min(q.n_valid, std::max(0, n - 1));
     }
+}
+int Engine::n_seqs() const { return (int) p_->seqs.size(); }
+void Engine::select(int s) {
+    if (s < 0 || s >= (int) p_->seqs.size()) throw std::runtime_error("strata-oss: no conversation slot " + std::to_string(s));
+    p_->cur = s;
+}
+int Engine::selected() const { return p_->cur; }
+const float* Engine::step_multi(const std::vector<int>& slots, const std::vector<int32_t>& toks) {
+    return p_->step_multi(slots, toks);
 }
 bool Engine::has_draft() const { return p_->eg.on; }
 int Engine::draft(int32_t pending, int k, std::vector<int32_t>& out) { return p_->draft(pending, k, out); }
-const std::vector<int32_t>& Engine::history() const { return p_->hist; }
+const std::vector<int32_t>& Engine::history() const { return p_->seqs[(size_t) p_->cur].hist; }
 Stats& Engine::stats() { return p_->st; }
 void Engine::save_profile() { p_->save_profile(); }
 void Engine::set_busy(bool b) { p_->pool->set_hot(b); }

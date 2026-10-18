@@ -1,3 +1,11 @@
+> **This fork: gpt-oss-120b on Strata's mechanism.** The [`oss/`](oss/) directory is a separate engine that runs
+> OpenAI's gpt-oss-120b (and 20b) the Strata way: hottest experts in VRAM across the GPUs, the rest computed by the
+> CPU from RAM, prompts with experts streamed over PCIe, prompt-lookup and EAGLE3 speculation. Measured on a Ryzen 7
+> 9800X3D + RX 9070 XT 16 GB + Radeon AI PRO R9700 32 GB, 30 GB RAM: 91-131 tok/s output, 1,600-2,700 tok/s prompts
+> (llama.cpp on the same PC: 50.5 / 791). Start with [oss/README.md](oss/README.md); the full write-up is
+> [oss/paper/strata-oss.md](oss/paper/strata-oss.md), the step-by-step measurements [oss/FINDINGS.md](oss/FINDINGS.md).
+> Everything below is the upstream Strata README (Qwen3.8-Flash-Next), unchanged.
+
 <h1 align="center">Strata</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)

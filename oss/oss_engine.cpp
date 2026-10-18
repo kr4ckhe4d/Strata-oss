@@ -860,18 +860,16 @@ struct Engine::Impl {
         dequant_q8_0_f16(L.qkv_q, L.qkv_d, d.w16, H, R, s);
         gemm16(d, d.w16, R, H, d.xn16, ntok, d.pqkv);
         add_bias(d.pqkv, L.qkv_b, R, ntok, s);
+        // OSS_PROF=1: where the attention block's time goes (synchronizes after each piece)
+        Clock::time_point last = tp0;
         auto mark = [&](double& acc) {
             if (!prof) return;
             HIPCHECK(hipStreamSynchronize(s));
-            static Clock::time_point last;
             const auto now = Clock::now();
-            acc += 1e3 * secs(last == Clock::time_point{} ? tp0 : last, now);
+            acc += 1e3 * secs(last, now);
             last = now;
         };
         static double t_qkv = 0, t_attn = 0, t_o = 0, t_rt = 0;
-        if (prof) { HIPCHECK(hipStreamSynchronize(s)); }
-        double dummy = 0;
-        (void) dummy;
         mark(t_qkv);
         rope_store_prompt(d.pqkv, L.kc, L.vc, pos0, hp.NH, hp.NKV, hp.HD, L.cap, hp.rope, ntok, s);
         attn_prompt(d.pqkv, L.kc, L.vc, L.sinks, pos0, d.ao16, hp.NH, hp.NKV, hp.HD, L.cap, L.window, ntok, s);

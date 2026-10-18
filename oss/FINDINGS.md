@@ -79,3 +79,16 @@ R9700 32 GB (gfx1201), Linux (CachyOS), ROCm 7.2. Models: ggml-org `gpt-oss-120b
 - `llama-bench` with mmap on this 30 GB PC hung for 28 min: the CPU-side experts kept getting evicted and re-read from
   the SSD (~200 MB/s steady reads). `-lm none` (no mmap; the flag was `-mmp` in older builds) fixed it.
 - `--n-cpu-moe` takes the *first* N layers; with `-ts` those must land on GPU 0's share, or GPU 1 runs out of memory.
+
+## 7. Where the rest of the prompt time goes (120b, 1,005 tokens, 750 ms total)
+
+`OSS_PROF=1` totals over the 36 layers (synchronizing after each piece): experts ~420 ms, q/k/v projection 133 ms,
+output projection 87 ms, attention 72 ms, router 9 ms.
+
+- **The dense projections are bound by hipBLAS on gfx1201, not the card.** Standalone benchmark, R9700, the q/k/v
+  shape (5120 x N x 2880): `hipblasGemmEx` f16 in, f32 or f16 out, 10-15 TFLOPS at N = 1005..4096 (one f16-compute
+  case 26 TFLOPS at N = 4096). Padding N to 1024 changes nothing; weights stored transposed (opA = N) are ~25% faster
+  than opA = T. RDNA4's f16 / int8 WMMA peak is several times higher, so rocBLAS's gfx1201 kernels are untuned for
+  these shapes.
+- Next lever when prompt speed matters again: own WMMA kernels (`__builtin_amdgcn_wmma_*_gfx12`) for the dense
+  projections and for the expert tiles (int8 WMMA instead of dp4a), and a WMMA attention for long prompts.

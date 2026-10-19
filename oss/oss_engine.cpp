@@ -1617,6 +1617,12 @@ bool Engine::has_draft() const { return p_->eg.on; }
 int Engine::draft(int32_t pending, int k, std::vector<int32_t>& out) { return p_->draft(pending, k, out); }
 const std::vector<int32_t>& Engine::history() const { return p_->seqs[(size_t) p_->cur].hist; }
 Stats& Engine::stats() { return p_->st; }
+int64_t Engine::expert_slots() const {
+    int64_t n = 0;
+    for (auto& d : p_->devs) n += d.n_slots;
+    return n;
+}
+double Engine::expert_mib() const { return p_->blob_bytes / 1048576.0; }
 void Engine::save_profile() { p_->save_profile(); }
 void Engine::set_busy(bool b) { p_->pool->set_hot(b); }
 

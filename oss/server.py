@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import collections
 import json
 import pathlib
 import queue
@@ -28,6 +29,92 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import oss_tokenizer  # noqa: E402
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+WEB = ROOT / "serve" / "web"   # Strata's web app (chat + Monitor), served as it is
+CTYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml",
+          ".woff2": "font/woff2", ".png": "image/png", ".webp": "image/webp", ".json": "application/json"}
+
+
+class Stats:
+    """What the dashboard's Monitor shows: the answers in flight, the last ones, the totals, a token-rate window."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.live: dict[str, dict] = {}
+        self.history: collections.deque = collections.deque(maxlen=500)
+        self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
+                       "prompt_ms": 0.0, "decode_ms": 0.0, "drafts_offered": 0, "drafts_accepted": 0}
+        self.stamps: collections.deque = collections.deque(maxlen=4096)
+        self.prefill_rates: collections.deque = collections.deque(maxlen=20)
+
+    def start(self, rid, prompt_tokens, max_tokens):
+        with self.lock:
+            self.live[rid] = {"started": time.time(), "prompt_tokens": prompt_tokens, "generated": 0,
+                              "first": None, "max_tokens": max_tokens}
+
+    def token(self, rid):
+        now = time.time()
+        with self.lock:
+            r = self.live.get(rid)
+            if r:
+                r["generated"] += 1
+                if r["first"] is None:
+                    r["first"] = now
+            self.stamps.append(now)
+
+    def tok_s(self, window=3.0):
+        now = time.time()
+        with self.lock:
+            n = sum(1 for t in self.stamps if now - t <= window)
+        return n / window if n else 0.0
+
+    def finish(self, rid, done: dict, n_gen: int, finish: str):
+        with self.lock:
+            r = self.live.pop(rid, None)
+            if not r:
+                return
+            pm = 1000 * float(done.get("t_prompt") or 0)
+            dm = 1000 * float(done.get("t_gen") or 0)
+            reused = int(done.get("n_reused") or 0)
+            routed, hits = done.get("routed"), done.get("hits")
+            read = r["prompt_tokens"] - reused
+            if pm > 0 and read > 32:
+                self.prefill_rates.append(read / (pm / 1000))
+            self.history.append({
+                "time": r["started"], "duration_s": round(time.time() - r["started"], 1), "finish": finish,
+                "prompt_tokens": r["prompt_tokens"], "prompt_total": r["prompt_tokens"], "reused": reused,
+                "output_tokens": n_gen, "prompt_ms": pm, "decode_ms": dm,
+                "decode_tok_s": round(n_gen / (dm / 1000), 1) if dm > 0 and n_gen else None,
+                "hit_rate": round(hits / routed, 3) if routed else None, "pcie_share": None,
+                "drafts_offered": done.get("drafted"), "drafts_accepted": done.get("kept"), "projection": None})
+            t = self.totals
+            t["requests"] += 1
+            t["prompt_tokens"] += r["prompt_tokens"]
+            t["reused"] += reused
+            t["output_tokens"] += n_gen
+            t["prompt_ms"] += pm
+            t["decode_ms"] += dm
+            t["drafts_offered"] += int(done.get("drafted") or 0)
+            t["drafts_accepted"] += int(done.get("kept") or 0)
+
+    def live_view(self):
+        now = time.time()
+        with self.lock:
+            live = list(self.live.values())
+        reading = [r for r in live if r["first"] is None]
+        gen = [r for r in live if r["first"] is not None]
+        state = "reading" if reading else "generating" if gen else "idle"
+        r = (reading or gen or [None])[-1]
+        return {"state": state, "queued": 0, "phase": None,
+                "prompt_tokens": r["prompt_tokens"] if r else None, "prompt_read": None, "prompt_total": None,
+                "generated": r["generated"] if r else None, "max_tokens": r["max_tokens"] if r else None,
+                "elapsed_s": round(now - r["started"], 1) if r else None,
+                "tok_s": round(self.tok_s(), 1) if state == "generating" else None,
+                "tok_s_mean": round(self.tok_s(), 1) if state == "generating" else None,
+                "prefill_tok_s_mean": round(sum(self.prefill_rates) / len(self.prefill_rates))
+                if self.prefill_rates and state == "reading" else None,
+                "running": len(live)}
 
 START, END, MESSAGE, CHANNEL, CONSTRAIN, RETURN, CALL = 200006, 200007, 200008, 200005, 200003, 200002, 200012
 STOP_IDS = [RETURN, CALL, 199999]
@@ -50,6 +137,7 @@ class Engine:
             raise RuntimeError("engine did not start: %r" % ev)
         self.n_ctx = ev["n_ctx"]
         self.parallel = ev.get("parallel", 1)
+        self.info = ev
 
     def _read(self):
         for line in self.p.stdout:
@@ -175,7 +263,8 @@ class Harmony:
         return out
 
 
-def make_handler(eng: Engine, tk, model_name: str, api_key: str | None, default_effort: str):
+def make_handler(eng: Engine, tk, model_name: str, api_key: str | None, default_effort: str, stats: Stats,
+                 telemetry):
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -198,12 +287,57 @@ def make_handler(eng: Engine, tk, model_name: str, api_key: str | None, default_
             self._json(401, {"error": {"message": "invalid api key", "type": "invalid_request_error"}})
             return False
 
+        def _file(self, path: pathlib.Path):
+            try:
+                body = path.read_bytes()
+            except OSError:
+                return self._json(404, {"error": {"message": "not found"}})
+            self.send_response(200)
+            self.send_header("Content-Type", CTYPES.get(path.suffix, "application/octet-stream"))
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _metrics(self):
+            info = eng.info
+            slots = int(info.get("expert_slots") or 0)
+            spec = []
+            if info.get("spec"):
+                spec.append("prompt lookup")
+                if info.get("draft"):
+                    spec.append("EAGLE3")
+            engine = {"model": model_name, "max_context": eng.n_ctx, "images": False, "version": "strata-oss",
+                      "expert_slots": slots, "expert_cache_mib": round(slots * float(info.get("expert_mib") or 0)),
+                      "kv": "f16", "spec": " + ".join(spec) or "off", "parallel": eng.parallel}
+            tel = telemetry.snapshot() if telemetry else {"now": {}, "history": {}, "static": {}}
+            with stats.lock:
+                hist = list(stats.history)
+                totals = dict(stats.totals)
+            return {"engine": engine, "live": stats.live_view(), "requests": hist[::-1][:12], "requests_kept": len(hist),
+                    "totals": totals, "hardware": tel["now"], "hardware_static": tel["static"],
+                    "history": tel["history"], "conversation_cache": None, "time": time.time()}
+
         def do_GET(self):
-            if self.path.rstrip("/") in ("/health", ""):
-                return self._json(200, {"status": "ok"})
+            path = self.path.split("?", 1)[0]
+            if path in ("/", "/index.html"):
+                return self._file(WEB / "index.html")
+            if path.startswith("/web/"):
+                f = (WEB / path[len("/web/"):]).resolve()
+                if WEB.resolve() not in f.parents:
+                    return self._json(404, {"error": {"message": "not found"}})
+                return self._file(f)
+            if path.rstrip("/") == "/health":
+                return self._json(200, {"status": "ok", "model": model_name, "max_context": eng.n_ctx, "images": False,
+                                        "image_generation": False, "api_key": bool(api_key), "loaded": True,
+                                        "service": "strata-oss", "parallel": eng.parallel})
             if not self._auth():
                 return
-            if self.path.startswith("/v1/models"):
+            if path == "/metrics":
+                return self._json(200, self._metrics())
+            if path == "/settings":
+                return self._json(200, {"shared": False})
+            if path.startswith("/v1/models"):
                 return self._json(200, {"object": "list", "data": [
                     {"id": model_name, "object": "model", "owned_by": "strata-oss", "context_length": eng.n_ctx}]})
             self._json(404, {"error": {"message": "not found"}})
@@ -211,6 +345,8 @@ def make_handler(eng: Engine, tk, model_name: str, api_key: str | None, default_
         def do_POST(self):
             if not self._auth():
                 return
+            if self.path.split("?", 1)[0] == "/settings":
+                return self._json(200, {"shared": False})
             n = int(self.headers.get("Content-Length") or 0)
             try:
                 req = json.loads(self.rfile.read(n) or b"{}")
@@ -257,6 +393,8 @@ def make_handler(eng: Engine, tk, model_name: str, api_key: str | None, default_
                 except (BrokenPipeError, ConnectionResetError):
                     gone["v"] = True
 
+            srid = uuid.uuid4().hex
+            stats.start(srid, len(tokens), max_tokens)
             if stream:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -270,6 +408,7 @@ def make_handler(eng: Engine, tk, model_name: str, api_key: str | None, default_
                     done = ev
                     break
                 n_gen += 1
+                stats.token(srid)
                 if not chat:
                     if ev in (RETURN, 199999):
                         continue
@@ -294,6 +433,7 @@ def make_handler(eng: Engine, tk, model_name: str, api_key: str | None, default_
                     elif kind == "tool_args" and stream:
                         send_sse(chunk({"tool_calls": [{"index": len(hp.calls) - 1, "function": {"arguments": val}}]}))
             reason = done.get("reason", "stop")
+            stats.finish(srid, done, n_gen, "error" if done.get("type") == "error" else reason)
             if done.get("type") == "error":
                 if stream:
                     send_sse({"error": {"message": done.get("error")}})
@@ -361,7 +501,18 @@ def main():
     eng = Engine(a.engine, a.model, extra)
     name = a.name or pathlib.Path(a.model).stem
     signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))
-    srv = ThreadingHTTPServer((a.host, a.port), make_handler(eng, tk, name, a.api_key, a.reasoning))
+    stats = Stats()
+    telemetry = None
+    try:
+        sys.path.insert(0, str(ROOT / "serve"))
+        import telemetry as tm  # Strata's: GPU load / VRAM / temperature / power / PCIe from sysfs, CPU, RAM, disk
+        gpus = [i for i in range(8) if tm.gpu_reader(i, True).ok() and
+                (tm.gpu_reader(i, True).read().get("mem_total") or 0) >= 4 << 30]  # bytes: not the iGPU
+        telemetry = tm.Telemetry(extra=lambda: {"tok_s": stats.tok_s()}, gpu_index=gpus[0] if gpus else 0,
+                                 gpu_indices=gpus or None, amd=True)
+    except Exception as e:  # noqa: BLE001 - the Monitor's hardware tiles are optional
+        print("strata-oss server: no hardware readings:", e, file=sys.stderr, flush=True)
+    srv = ThreadingHTTPServer((a.host, a.port), make_handler(eng, tk, name, a.api_key, a.reasoning, stats, telemetry))
     print(f"strata-oss server: http://{a.host}:{a.port}/v1 ({name}, context {eng.n_ctx}, {eng.parallel} at once)",
           file=sys.stderr, flush=True)
     try:

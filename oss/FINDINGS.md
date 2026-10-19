@@ -368,3 +368,16 @@ decode path, which rounds differently from the prompt path; reading the whole pr
 - Through the HTTP server (`-- --parallel 4`, EAGLE3 loaded): 4 simultaneous chat requests all answered correctly;
   a lone request still gets EAGLE3 drafts.
 - Not done: reading a new prompt while others decode (it blocks them for its duration), drafts in batched steps.
+
+## 21. Strata's dashboard on the gpt-oss server
+
+`oss/server.py` serves Strata's web app (`serve/web`: chat + Monitor + About) at `/`, as it is. It needed `health`
+(the model's name, no images), `settings` (no shared defaults), and `metrics` in Strata's shape: the engine's facts
+(expert slots and cache size from the engine's `ready` line, the speculation in use), the live state (reading /
+generating, a 3 s token-rate window), the last requests (speed, VRAM hit rate and drafts per request, from the
+engine's `done` line) and totals, and the hardware through Strata's own `serve/telemetry.py` (both AMD cards from
+sysfs: load, VRAM, temperature, power, PCIe; CPU, RAM, disk through psutil). `config` and `mcp` answer 404 and the
+page hides those cards. Pitfall: telemetry's `mem_total` is bytes, so the "not the iGPU" filter needs 4 << 30.
+
+Serving at the model's full context (`--ctx 131072`, one conversation, EAGLE3 loaded): 2,929 expert slots (3,100 at
+32K x 2), 20.7 GB of experts in RAM, ~5 GB of RAM left; a short chat answer 112-113 tok/s.

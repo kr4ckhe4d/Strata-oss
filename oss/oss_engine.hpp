@@ -73,6 +73,8 @@ public:
     const std::vector<int32_t>& history() const;
 
     Stats& stats();
+    int64_t expert_slots() const;    // experts held in VRAM, all GPUs
+    double expert_mib() const;       // one expert's size
     void report(FILE* f) const;
     void save_profile();
     /// Lets the CPU workers sleep (between requests).

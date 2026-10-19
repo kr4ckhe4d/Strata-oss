@@ -366,7 +366,9 @@ int main(int argc, char** argv) {
         {
             std::ostringstream ss;
             ss << "{\"type\":\"ready\",\"n_vocab\":" << V << ",\"n_ctx\":" << eng.n_ctx()
-               << ",\"parallel\":" << eng.n_seqs() << "}";
+               << ",\"parallel\":" << eng.n_seqs() << ",\"expert_slots\":" << eng.expert_slots()
+               << ",\"expert_mib\":" << eng.expert_mib() << ",\"draft\":" << (eng.has_draft() ? "true" : "false")
+               << ",\"spec\":" << (spec ? "true" : "false") << "}";
             emit(ss.str());
         }
         struct Req {
@@ -378,6 +380,7 @@ int main(int argc, char** argv) {
             bool started = false, cancel = false, spec = true;
             std::chrono::steady_clock::time_point t0;
             double t_prompt = 0;
+            uint64_t routed0 = 0, hits0 = 0;  // the engine's routing counters when the answer started
         };
         std::vector<std::unique_ptr<Req>> active, waiting;
         std::vector<char> slot_busy((size_t) eng.n_seqs(), 0);
@@ -392,7 +395,10 @@ int main(int argc, char** argv) {
             ss << "{\"type\":\"done\",\"rid\":" << jstr(r.rid) << ",\"reason\":\"" << reason << "\",\"n_gen\":"
                << r.n_gen << ",\"n_prompt\":" << r.toks.size() << ",\"n_reused\":" << r.reused
                << ",\"t_prompt\":" << r.t_prompt << ",\"t_gen\":" << (tt - r.t_prompt)
-               << ",\"steps\":" << (r.gen ? r.gen->st.steps : 0) << "}";
+               << ",\"steps\":" << (r.gen ? r.gen->st.steps : 0)
+               << ",\"drafted\":" << (r.gen ? r.gen->st.drafted : 0) << ",\"kept\":" << (r.gen ? r.gen->st.accepted : 0)
+               << ",\"routed\":" << (eng.stats().routed - r.routed0) << ",\"hits\":" << (eng.stats().gpu_hits - r.hits0)
+               << "}";
             emit(ss.str());
             if (r.slot >= 0) slot_busy[(size_t) r.slot] = 0;
             r.slot = -1;
@@ -446,6 +452,8 @@ int main(int argc, char** argv) {
                         r->smp.rng.seed((uint64_t) req.num("seed", (double) std::random_device{}()));
                         r->spec = spec && !req.get("no_spec");
                         r->t0 = std::chrono::steady_clock::now();
+                        r->routed0 = eng.stats().routed;
+                        r->hits0 = eng.stats().gpu_hits;
                         if (r->toks.empty() || (int) r->toks.size() >= eng.n_ctx()) {
                             emit("{\"type\":\"error\",\"rid\":" + jstr(rid) + ",\"error\":\"" +
                                  (r->toks.empty() ? "no tokens" : "prompt longer than the context") + "\"}");

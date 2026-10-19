@@ -53,12 +53,30 @@ architecture) faster than llama.cpp on this PC, and if so, run it.
 6. **Throughout:** log every measurement and the reason for each bottleneck (the user wants this), commit each step,
    push, keep `oss/README.md`-style run instructions current.
 
-## Also open from the gpt-oss work (optional)
+## Also open from the gpt-oss work (can be done first, ~100-120K tokens of context)
 
-- Small-prompt speed-up for agent turns ("prompt CPU share"): a short new chunk still streams nearly every expert
-  missing from VRAM over PCIe (~0.3-0.5 s); let the CPU compute the missing experts of small chunks instead. Seen on
-  the user's dashboard: prefill 458-649 tok/s for ~200-300 new tokens with 12K reused.
-- Reading a new prompt pauses the other conversations; batched steps use no drafts.
+Gates for both: build (`cmake --build build-oss`), perplexity / bitwise checks as in PORTING.md §4, measure before
+and after on the 120b (needs the GPUs: ask), append to FINDINGS.md, commit, push.
+
+1. **Small prompts: the CPU computes the missing experts** ("prompt CPU share", as Strata does). Seen on the user's
+   dashboard: a follow-up with ~200-300 new tokens (12K reused) reads at 458-649 tok/s, because `prompt_layer`
+   (`oss/oss_engine.cpp`, the expert half after the router sync) streams every routed expert missing from VRAM over
+   PCIe (up to ~1,200 x 12.6 MiB at 28.7 GB/s) whatever the chunk size. Approach: when `ntok` is small (threshold
+   to measure, ~256), skip the ring for the missing experts: copy the chunk's int8 FFN input (`d.pq`/`d.pqd` after
+   `quant_q8`, or `xsq`/`xsd` rows) and the routing to the host, run the missing experts on the CPU pool with
+   `cpu::compute_misses` (its jobs are (column, expert); columns = tokens; group in <= 8 columns per call or extend
+   `rows2_cols_n`), while the GPU runs the VRAM group (`mmq_gate_up`/`mmq_down` on group 0 only); then upload the
+   CPU's per-assignment outputs into `d.ys` rows (same `inv` layout) before `moe_combine`. Measure ms per layer with
+   `OSS_PROF=1` for 32 / 128 / 256 / 512-token chunks both ways to set the threshold. Gate: perplexity on the
+   2,000-token document unchanged (int8 CPU vs WMMA rounding differ a little: compare KL), the follow-up prompt time
+   down.
+2. **A new prompt no longer pauses the running answers.** In `oss/oss_main.cpp`'s serve loop (step 3, "one new
+   prompt"), instead of `eng.eval(rest)` for the whole prompt, keep a per-request read cursor and evaluate at most
+   ~512-1024 tokens of it per loop iteration (`eng.select(slot); eng.eval(piece)`; eval appends), running step 4
+   (the decode of the others) between pieces; the request joins the batch when its prompt is read. Gate: answers
+   token-identical with and without (greedy); the running answers keep ~their speed while a 16K prompt is read
+   (measure tok/s of a running answer during the read).
+- Not planned: drafts inside batched steps (verify windows per conversation within one step).
 
 ## Restore the user's servers (only when asked)
 

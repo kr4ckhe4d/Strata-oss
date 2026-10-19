@@ -146,6 +146,9 @@ struct Dev {
     int32_t* tiles = nullptr;
     const uint8_t** wptr = nullptr;
     hipEvent_t staged = nullptr;
+    float* ycpu = nullptr;          // [E * prompt_cpu][H] the CPU's expert sums, one row per token that has any
+    int32_t* yrow = nullptr;        // [chunk] the token's ycpu row, or -1
+    hipEvent_t qready = nullptr;    // the chunk's int8 FFN input is on the host
     uint16_t *xn16 = nullptr, *ao16 = nullptr, *ph16 = nullptr, *w16 = nullptr, *w2 = nullptr;
     int32_t *ptopk = nullptr, *rows = nullptr, *inv = nullptr;
     std::vector<uint8_t*> ring;
@@ -229,6 +232,14 @@ struct Engine::Impl {
     int32_t* inv_h = nullptr;
     int32_t* tiles_h = nullptr;             // [4 * (chunk * K / 32 + E)]
     const uint8_t** wptr_h = nullptr;       // [E]
+    float* ptopw_h = nullptr;               // [chunk * K] the router weights (for the CPU's experts)
+    int8_t* pq_h = nullptr;                 // [chunk][H] the int8 FFN input, as the GPU rounded it
+    float* pqd_h = nullptr;                 // [chunk][H / 32]
+    float* ycpu_h = nullptr;                // [cpu_rows()][H] the CPU's sums
+    int32_t* yrow_h = nullptr;              // [chunk]
+    cpu::MissScratch pscratch;              // [cpu_rows()] jobs
+    // at most E * prompt_cpu assignments (and so tokens) of a chunk go to the CPU
+    int cpu_rows() const { return std::min(o.chunk * kTopK, hp.E * o.prompt_cpu); }
     uint8_t* swap_h = nullptr;              // one blob, pinned
     const uint8_t* embd = nullptr;          // token_embd (Q8_0, in the mapping)
     uint32_t embd_type = 0;
@@ -550,6 +561,11 @@ struct Engine::Impl {
         d.tiles = dalloc<int32_t>(4 * (C * kTopK / 32 + E));
         d.wptr = (const uint8_t**) dalloc<void*>(E);
         HIPCHECK(hipEventCreateWithFlags(&d.staged, hipEventDisableTiming));
+        if (o.prompt_cpu > 0) {
+            d.ycpu = dalloc<float>((size_t) cpu_rows() * H);
+            d.yrow = dalloc<int32_t>(C);
+            HIPCHECK(hipEventCreateWithFlags(&d.qready, hipEventDisableTiming));
+        }
         d.w16 = dalloc<uint16_t>((size_t) R * H);
         d.w2 = dalloc<uint16_t>(std::max((size_t) H * F, (size_t) H * NA));
         for (int r = 0; r < 16; ++r) {
@@ -728,6 +744,14 @@ struct Engine::Impl {
         HIPCHECK(hipHostMalloc((void**) &inv_h, sizeof(int32_t) * o.chunk * kTopK, hipHostMallocPortable));
         HIPCHECK(hipHostMalloc((void**) &tiles_h, sizeof(int32_t) * 4 * (o.chunk * kTopK / 32 + hp.E), hipHostMallocPortable));
         HIPCHECK(hipHostMalloc((void**) &wptr_h, sizeof(void*) * hp.E, hipHostMallocPortable));
+        if (o.prompt_cpu > 0) {
+            const size_t C = o.chunk;
+            HIPCHECK(hipHostMalloc((void**) &ptopw_h, sizeof(float) * C * kTopK, hipHostMallocPortable));
+            HIPCHECK(hipHostMalloc((void**) &pq_h, C * hp.H, hipHostMallocPortable));
+            HIPCHECK(hipHostMalloc((void**) &pqd_h, sizeof(float) * C * (hp.H / 32), hipHostMallocPortable));
+            HIPCHECK(hipHostMalloc((void**) &ycpu_h, sizeof(float) * cpu_rows() * hp.H, hipHostMallocPortable));
+            HIPCHECK(hipHostMalloc((void**) &yrow_h, sizeof(int32_t) * C, hipHostMallocPortable));
+        }
     }
 
 
@@ -1336,6 +1360,10 @@ struct Engine::Impl {
         add_bias(d.plog, L.router_b, E, ntok, s);
         router_topk(d.plog, E, ntok, d.ptopk, d.ptopw, s);
         HIPCHECK(hipMemcpyAsync(ptopk_h, d.ptopk, sizeof(int32_t) * ntok * kTopK, hipMemcpyDeviceToHost, s));
+        // the RAM experts few of the chunk's tokens use: the CPU computes them (streaming one costs a full blob over
+        // PCIe however few tokens use it)
+        const bool cpu_ok = o.prompt_cpu > 0;
+        if (cpu_ok) HIPCHECK(hipMemcpyAsync(ptopw_h, d.ptopw, sizeof(float) * ntok * kTopK, hipMemcpyDeviceToHost, s));
         HIPCHECK(hipStreamSynchronize(s));
         mark(t_rt);
         if (prof && l == hp.L - 1)
@@ -1356,6 +1384,18 @@ struct Engine::Impl {
                 if (h.slot[e] >= 0) { st.prompt_hits += cnt[e]; order.push_back(e); }
                 else miss.push_back(e);
             }
+        std::vector<char> on_cpu;
+        int n_cpu = 0;
+        if (cpu_ok && !miss.empty()) {
+            // an expert many of the chunk's tokens use costs the CPU more than its one PCIe copy: those still stream
+            on_cpu.assign(E, 0);
+            std::vector<int> streamed;
+            for (int e : miss) {
+                if (cnt[e] <= o.prompt_cpu) { on_cpu[e] = 1; ++n_cpu; }
+                else streamed.push_back(e);
+            }
+            miss.swap(streamed);
+        }
         const int n_res = (int) order.size();
         order.insert(order.end(), miss.begin(), miss.end());
         {
@@ -1363,10 +1403,13 @@ struct Engine::Impl {
             for (int e : order) { off[e] = o; o += cnt[e]; }
         }
         std::vector<int> fill(off);
+        int na_gpu = 0;  // the assignments the GPU computes (sorted rows [0, na_gpu))
         for (int a = 0; a < na; ++a) {
             const int e = ptopk_h[a];
+            if (n_cpu && on_cpu[e]) { inv_h[a] = -1; continue; }
             rows_h[fill[e]] = a / kTopK;
             inv_h[a] = fill[e]++;
+            ++na_gpu;
         }
         // tiles per group: group 0 = the VRAM experts, group g >= 1 = misses [(g-1)*B, g*B)
         const int RN = (int) d.ring.size(), B = RN / 2;
@@ -1377,7 +1420,7 @@ struct Engine::Impl {
             gtile[g] = nt;
             const int i0 = g == 0 ? 0 : n_res + (g - 1) * B;
             const int i1 = g == 0 ? n_res : std::min((int) order.size(), n_res + g * B);
-            grow[g] = i0 < (int) order.size() ? off[order[i0]] : na;
+            grow[g] = i0 < (int) order.size() ? off[order[i0]] : na_gpu;
             for (int i = i0; i < i1; ++i) {
                 const int e = order[i];
                 for (int r = 0; r < cnt[e]; r += 32) {
@@ -1387,17 +1430,22 @@ struct Engine::Impl {
             }
         }
         gtile[n_groups] = nt;
-        grow[n_groups] = na;
+        grow[n_groups] = na_gpu;
         for (int e = 0; e < E; ++e) wptr_h[e] = h.slot[e] >= 0 ? d.arena + (size_t) h.slot[e] * blob_bytes : nullptr;
         for (size_t i = 0; i < miss.size(); ++i) wptr_h[miss[i]] = d.ring[i % RN];
-        HIPCHECK(hipMemcpyAsync(d.rows, rows_h, sizeof(int32_t) * na, hipMemcpyHostToDevice, s));
+        HIPCHECK(hipMemcpyAsync(d.rows, rows_h, sizeof(int32_t) * std::max(na_gpu, 1), hipMemcpyHostToDevice, s));
         HIPCHECK(hipMemcpyAsync(d.inv, inv_h, sizeof(int32_t) * na, hipMemcpyHostToDevice, s));
         HIPCHECK(hipMemcpyAsync(d.tiles, tiles_h, sizeof(int32_t) * 4 * nt, hipMemcpyHostToDevice, s));
         HIPCHECK(hipMemcpyAsync(d.wptr, wptr_h, sizeof(void*) * E, hipMemcpyHostToDevice, s));
         // the host buffers are rewritten by the next layer: wait for these copies before returning (cheap)
         HIPCHECK(hipEventRecord(d.staged, s));
         quant_q8(d.ph32, d.pq, d.pqd, H, ntok, s);
-        gather_rows_q8(d.pq, d.pqd, d.rows, d.xsq, d.xsd, H, na, s);
+        if (n_cpu) {
+            HIPCHECK(hipMemcpyAsync(pq_h, d.pq, (size_t) ntok * H, hipMemcpyDeviceToHost, s));
+            HIPCHECK(hipMemcpyAsync(pqd_h, d.pqd, sizeof(float) * ntok * (H / 32), hipMemcpyDeviceToHost, s));
+            HIPCHECK(hipEventRecord(d.qready, s));
+        }
+        if (na_gpu > 0) gather_rows_q8(d.pq, d.pqd, d.rows, d.xsq, d.xsd, H, na_gpu, s);
         auto issue = [&](int i) {
             const int r = i % RN;
             HIPCHECK(hipStreamWaitEvent(d.cs, d.ring_used[r], 0));
@@ -1421,13 +1469,43 @@ struct Engine::Impl {
                 if (issued < (int) miss.size()) issue(issued++);
             }
         }
+        double t_cpu = 0;
+        if (n_cpu) {
+            // while the GPU computes the VRAM experts: the RAM ones on the CPU pool, from the GPU's int8 input
+            const auto tc0 = Clock::now();
+            std::vector<cpu::MissJob> jobs;
+            int nrow = 0;
+            for (int t = 0; t < ntok; ++t) yrow_h[t] = -1;
+            for (int a = 0; a < na; ++a) {
+                const int e = ptopk_h[a];
+                if (!on_cpu[e]) continue;
+                const int t = a / kTopK;
+                if (yrow_h[t] < 0) yrow_h[t] = nrow++;
+                cpu::MissJob j;
+                j.blob = h.blob[e];
+                j.gate_b = h.gate_b.data() + (size_t) e * F;
+                j.up_b = h.up_b.data() + (size_t) e * F;
+                j.down_b = h.down_b.data() + (size_t) e * H;
+                j.col = t;
+                j.ycol = yrow_h[t];
+                j.w = ptopw_h[a];
+                jobs.push_back(j);
+            }
+            HIPCHECK(hipEventSynchronize(d.qready));
+            cpu::compute_misses(*pool, jobs, pq_h, H, pqd_h, H / 32, ycpu_h, H, pscratch);
+            HIPCHECK(hipMemcpyAsync(d.ycpu, ycpu_h, sizeof(float) * nrow * H, hipMemcpyHostToDevice, s));
+            HIPCHECK(hipMemcpyAsync(d.yrow, yrow_h, sizeof(int32_t) * ntok, hipMemcpyHostToDevice, s));
+            t_cpu = 1e3 * secs(tc0, Clock::now());
+        }
         HIPCHECK(hipEventSynchronize(d.staged));
-        moe_combine(d.px, d.ys, d.inv, d.ptopk, d.ptopw, L.down_b, H, ntok, s);
+        moe_combine(d.px, d.ys, d.inv, d.ptopk, d.ptopw, L.down_b, H, ntok, s, n_cpu ? d.ycpu : nullptr,
+                    d.yrow);
         if (prof) {
             HIPCHECK(hipStreamSynchronize(s));
             const auto tp2 = Clock::now();
-            std::fprintf(stderr, "prof: layer %2d ntok %d attn+router %.1f ms, experts %.1f ms (%zu streamed, %d routed)\n", l,
-                         ntok, 1e3 * secs(tp0, tp1), 1e3 * secs(tp1, tp2), miss.size(), (int) order.size());
+            std::fprintf(stderr, "prof: layer %2d ntok %d attn+router %.1f ms, experts %.1f ms (%zu streamed, %d on the "
+                         "CPU %.1f ms, %d routed)\n", l, ntok, 1e3 * secs(tp0, tp1), 1e3 * secs(tp1, tp2), miss.size(),
+                         n_cpu, t_cpu, (int) order.size() + n_cpu);
         }
     }
 
@@ -1563,6 +1641,7 @@ struct Engine::Impl {
 Engine::Engine(const Options& o) : p_(new Impl) {
     Impl& m = *p_;
     m.o = o;
+    m.o.prompt_cpu = std::max(0, o.prompt_cpu);
     m.gguf.reset(new strata::GgufModel(strata::GgufModel::open(o.model)));
     m.read_hparams();
     if (m.o.ctx > m.hp.ctx_train) m.o.ctx = m.hp.ctx_train;
@@ -1581,6 +1660,7 @@ Engine::Engine(const Options& o) : p_(new Impl) {
     if (nt <= 0) nt = std::max(1u, std::thread::hardware_concurrency() / 2);
     m.pool.reset(new cpu::Pool(nt));
     m.scratch.init(m.hp.H, m.hp.F, kMaxCols * kTopK);
+    if (m.o.prompt_cpu > 0) m.pscratch.init(m.hp.H, m.hp.F, m.cpu_rows());
     std::fprintf(stderr, "strata-oss: ready (%d CPU workers)\n", nt);
 }
 

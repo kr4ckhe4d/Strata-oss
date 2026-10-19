@@ -118,9 +118,11 @@ void attn_prompt(const float* qkv, const uint16_t* kc, const uint16_t* vc, const
 void gather_rows_f16(const uint16_t* src, const int32_t* rows, uint16_t* dst, int n, int count, hipStream_t s);
 void swiglu_bias_f16(const float* gu, const float* gate_b, const float* up_b, uint16_t* out, int n_ff, int count,
                      hipStream_t s);
-// x[t] += sum_k w[t][k] * (ys[inv[t][k]] + down_b[e]) over the token's experts
+// x[t] += sum_k w[t][k] * (ys[inv[t][k]] + down_b[e]) over the token's experts; inv < 0: skipped (the CPU's);
+// with ycpu: + ycpu[yrow[t]] (the sum of the token's CPU-computed experts) where yrow[t] >= 0
 void moe_combine(float* x, const float* ys, const int32_t* inv, const int32_t* topk, const float* topw,
-                 const float* down_b, int n, int ntok, hipStream_t s);
+                 const float* down_b, int n, int ntok, hipStream_t s, const float* ycpu = nullptr,
+                 const int32_t* yrow = nullptr);
 
 // grouped prompt MoE: tiles = int4 (expert, first sorted row, rows <= 32, 0); wptr[e] = the expert's blob on the device
 void mmq_gate_up(const uint8_t* const* wptr, const int32_t* tiles, int tile0, int ntiles, const int8_t* xq,

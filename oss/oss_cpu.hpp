@@ -65,7 +65,8 @@ struct MissJob {
     const float* gate_b = nullptr;  ///< n_ff
     const float* up_b = nullptr;    ///< n_ff
     const float* down_b = nullptr;  ///< n_embd
-    int col = 0;
+    int col = 0;                    ///< the input column (hq / hd)
+    int ycol = -1;                  ///< the output row of y (-1: col)
     float w = 0.f;                  ///< router weight
 };
 
@@ -80,6 +81,7 @@ struct MissScratch {
 };
 
 /// y[c] (n_embd floats per column, zeroed here for every column that has a job) += sum of the column's jobs.
+/// Any number of columns (a prompt chunk's tokens); the jobs of one expert share its weight reads, 8 columns a pass.
 /// hq/hd: the columns' quantized FFN inputs (n_embd int8 + n_embd / 32 scales each, `hq_stride` / `hd_stride` apart).
 void compute_misses(Pool& pool, const std::vector<MissJob>& jobs, const int8_t* hq, size_t hq_stride, const float* hd,
                     size_t hd_stride, float* y, size_t y_stride, MissScratch& s);

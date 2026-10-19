@@ -279,25 +279,28 @@ void compute_misses(Pool& pool, const std::vector<MissJob>& jobs, const int8_t* 
             const int u = next1.fetch_add(1, std::memory_order_relaxed);
             if (u >= u1) break;
             const int g = u / (F / 32), rb = u % (F / 32);
-            const int nc = g0[g + 1] - g0[g];
             const MissJob& j0 = jobs[order[g0[g]]];
-            for (int c = 0; c < nc; ++c) {
-                const MissJob& jb = jobs[order[g0[g] + c]];
-                xq[c] = hq + (size_t) jb.col * hq_stride;
-                xd[c] = hd + (size_t) jb.col * hd_stride;
-            }
             const uint8_t* gm = j0.blob;
             const uint8_t* up = j0.blob + gate_bytes;
-            for (int i = 0; i < 32; ++i) {
-                const int r = rb * 32 + i;
-                rows2_cols_n(nc, gm + (size_t) r * nbh * 16, gm + (size_t) F * nbh * 16 + (size_t) r * nbh,
-                             up + (size_t) r * nbh * 16, up + (size_t) F * nbh * 16 + (size_t) r * nbh, xq, xd, nbh,
-                             gv, uv);
-                for (int c = 0; c < nc; ++c) act[c][i] = swiglu_oai(gv[c] + j0.gate_b[r], uv[c] + j0.up_b[r]);
-            }
-            for (int c = 0; c < nc; ++c) {
-                const int j = order[g0[g] + c];
-                quant_q8(act[c], s.aq.data() + (size_t) j * F + rb * 32, s.ad.data() + (size_t) j * nbf + rb, 32);
+            // a prompt's expert can have many columns: 8 at a time over the same 32 rows (they stay in cache)
+            for (int c0 = g0[g]; c0 < g0[g + 1]; c0 += 8) {
+                const int nc = std::min(8, g0[g + 1] - c0);
+                for (int c = 0; c < nc; ++c) {
+                    const MissJob& jb = jobs[order[c0 + c]];
+                    xq[c] = hq + (size_t) jb.col * hq_stride;
+                    xd[c] = hd + (size_t) jb.col * hd_stride;
+                }
+                for (int i = 0; i < 32; ++i) {
+                    const int r = rb * 32 + i;
+                    rows2_cols_n(nc, gm + (size_t) r * nbh * 16, gm + (size_t) F * nbh * 16 + (size_t) r * nbh,
+                                 up + (size_t) r * nbh * 16, up + (size_t) F * nbh * 16 + (size_t) r * nbh, xq, xd,
+                                 nbh, gv, uv);
+                    for (int c = 0; c < nc; ++c) act[c][i] = swiglu_oai(gv[c] + j0.gate_b[r], uv[c] + j0.up_b[r]);
+                }
+                for (int c = 0; c < nc; ++c) {
+                    const int j = order[c0 + c];
+                    quant_q8(act[c], s.aq.data() + (size_t) j * F + rb * 32, s.ad.data() + (size_t) j * nbf + rb, 32);
+                }
             }
         }
         pool.barrier();
@@ -306,36 +309,42 @@ void compute_misses(Pool& pool, const std::vector<MissJob>& jobs, const int8_t* 
             const int u = next2.fetch_add(1, std::memory_order_relaxed);
             if (u >= u2) break;
             const int g = u / (H / 32), rb = u % (H / 32);
-            const int nc = g0[g + 1] - g0[g];
             const MissJob& j0 = jobs[order[g0[g]]];
-            for (int c = 0; c < nc; ++c) {
-                const int j = order[g0[g] + c];
-                xq[c] = s.aq.data() + (size_t) j * F;
-                xd[c] = s.ad.data() + (size_t) j * nbf;
-            }
             const uint8_t* d = j0.blob + down_off;
-            for (int i = 0; i < 32; i += 2) {
-                const int r = rb * 32 + i;
-                rows2_cols_n(nc, d + (size_t) r * nbf * 16, d + (size_t) H * nbf * 16 + (size_t) r * nbf,
-                             d + (size_t) (r + 1) * nbf * 16, d + (size_t) H * nbf * 16 + (size_t) (r + 1) * nbf, xq, xd,
-                             nbf, v0, v1);
+            for (int c0 = g0[g]; c0 < g0[g + 1]; c0 += 8) {
+                const int nc = std::min(8, g0[g + 1] - c0);
                 for (int c = 0; c < nc; ++c) {
-                    const MissJob& jb = jobs[order[g0[g] + c]];
-                    float* z = s.z.data() + (size_t) order[g0[g] + c] * H;
-                    z[r] = jb.w * (v0[c] + j0.down_b[r]);
-                    z[r + 1] = jb.w * (v1[c] + j0.down_b[r + 1]);
+                    const int j = order[c0 + c];
+                    xq[c] = s.aq.data() + (size_t) j * F;
+                    xd[c] = s.ad.data() + (size_t) j * nbf;
+                }
+                for (int i = 0; i < 32; i += 2) {
+                    const int r = rb * 32 + i;
+                    rows2_cols_n(nc, d + (size_t) r * nbf * 16, d + (size_t) H * nbf * 16 + (size_t) r * nbf,
+                                 d + (size_t) (r + 1) * nbf * 16, d + (size_t) H * nbf * 16 + (size_t) (r + 1) * nbf,
+                                 xq, xd, nbf, v0, v1);
+                    for (int c = 0; c < nc; ++c) {
+                        const MissJob& jb = jobs[order[c0 + c]];
+                        float* z = s.z.data() + (size_t) order[c0 + c] * H;
+                        z[r] = jb.w * (v0[c] + j0.down_b[r]);
+                        z[r + 1] = jb.w * (v1[c] + j0.down_b[r + 1]);
+                    }
                 }
             }
         }
     };
     pool.run(fn);
     // the sum per column, in job order (deterministic, as before grouping)
-    std::vector<char> seen(64, 0);
+    auto ycol = [&](const MissJob& j) { return j.ycol >= 0 ? j.ycol : j.col; };
+    int max_col = 0;
+    for (const MissJob& j : jobs) max_col = std::max(max_col, ycol(j));
+    std::vector<char> seen((size_t) max_col + 1, 0);
     for (int j = 0; j < nj; ++j) {
-        float* yc = y + (size_t) jobs[j].col * y_stride;
+        const int c = ycol(jobs[j]);
+        float* yc = y + (size_t) c * y_stride;
         const float* z = s.z.data() + (size_t) j * H;
-        if (!seen[jobs[j].col]) {
-            seen[jobs[j].col] = 1;
+        if (!seen[c]) {
+            seen[c] = 1;
             std::memcpy(yc, z, sizeof(float) * H);
         } else {
             for (int i = 0; i < H; ++i) yc[i] += z[i];

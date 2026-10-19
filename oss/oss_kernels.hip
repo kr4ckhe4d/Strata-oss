@@ -721,7 +721,8 @@ __global__ void k_swiglu_bias_f16(const float* __restrict__ gu, const float* __r
 
 __global__ void k_moe_combine(float* __restrict__ x, const float* __restrict__ ys, const int32_t* __restrict__ inv,
                               const int32_t* __restrict__ topk, const float* __restrict__ topw,
-                              const float* __restrict__ down_b, int n) {
+                              const float* __restrict__ down_b, const float* __restrict__ ycpu,
+                              const int32_t* __restrict__ yrow, int n) {
     const int t = blockIdx.y;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -729,8 +730,10 @@ __global__ void k_moe_combine(float* __restrict__ x, const float* __restrict__ y
 #pragma unroll
     for (int k = 0; k < kTopK; ++k) {
         const int a = t * kTopK + k;
+        if (inv[a] < 0) continue;  // computed by the CPU (in ycpu, bias and weight included)
         acc += topw[a] * (ys[(size_t) inv[a] * n + i] + down_b[(size_t) topk[a] * n + i]);
     }
+    if (ycpu && yrow[t] >= 0) acc += ycpu[(size_t) yrow[t] * n + i];
     x[(size_t) t * n + i] += acc;
 }
 
@@ -1456,8 +1459,9 @@ void swiglu_bias_f16(const float* gu, const float* gate_b, const float* up_b, ui
 }
 
 void moe_combine(float* x, const float* ys, const int32_t* inv, const int32_t* topk, const float* topw,
-                 const float* down_b, int n, int ntok, hipStream_t s) {
-    hipLaunchKernelGGL(k_moe_combine, dim3(cdiv(n, 256), ntok), dim3(256), 0, s, x, ys, inv, topk, topw, down_b, n);
+                 const float* down_b, int n, int ntok, hipStream_t s, const float* ycpu, const int32_t* yrow) {
+    hipLaunchKernelGGL(k_moe_combine, dim3(cdiv(n, 256), ntok), dim3(256), 0, s, x, ys, inv, topk, topw, down_b, ycpu,
+                       yrow, n);
 }
 
 void mmq_gate_up(const uint8_t* const* wptr, const int32_t* tiles, int tile0, int ntiles, const int8_t* xq,

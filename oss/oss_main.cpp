@@ -165,7 +165,7 @@ std::vector<int> csv_ints(const std::string& s) {
 
 void usage() {
     std::fprintf(stderr,
-                 "strata-oss --model FILE.gguf [--gpus 0,1] [--split 12,24] [--ctx N] [--chunk N] [--threads N]\n"
+                 "strata-oss --model FILE.gguf [--gpus 0,1] [--split 12,24] [--ctx N] [--chunk N] [--prompt-cpu N] [--threads N]\n"
                  "           [--reserve-mib N] [--max-slots N] [--profile FILE] [--adapt-every N] [--adapt-swaps N]\n"
                  "           (--serve | --tokens FILE [--n-predict N] | --dump-logits OUT --tokens FILE)\n");
 }
@@ -189,6 +189,7 @@ int main(int argc, char** argv) {
         else if (a == "--split") o.split = csv_ints(next());
         else if (a == "--ctx") o.ctx = std::atoi(next().c_str());
         else if (a == "--chunk") o.chunk = std::atoi(next().c_str());
+        else if (a == "--prompt-cpu") o.prompt_cpu = std::atoi(next().c_str());
         else if (a == "--swa-slack") o.swa_slack = std::atoi(next().c_str());
         else if (a == "--threads") o.threads = std::atoi(next().c_str());
         else if (a == "--reserve-mib") o.reserve_mib = std::atof(next().c_str());

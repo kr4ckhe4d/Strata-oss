@@ -381,3 +381,60 @@ page hides those cards. Pitfall: telemetry's `mem_total` is bytes, so the "not t
 
 Serving at the model's full context (`--ctx 131072`, one conversation, EAGLE3 loaded): 2,929 expert slots (3,100 at
 32K x 2), 20.7 GB of experts in RAM, ~5 GB of RAM left; a short chat answer 112-113 tok/s.
+
+## 22. A prompt's rarely used RAM experts on the CPU (`--prompt-cpu N`)
+
+Before, the prompt path streamed every routed expert that was not in VRAM over PCIe, once per chunk: a full 12.6 MiB
+blob (0.44 ms at 28.7 GB/s) even when only one of the chunk's tokens used it. A short follow-up (a few hundred new
+tokens after a long reused conversation) spent most of its time on these copies: 256 new tokens read at ~750 tok/s.
+
+Now a missing expert used by at most N of the chunk's tokens (default 8) is computed by the CPU pool while the GPU
+computes the VRAM experts and streams the rest: the GPU's int8 FFN input (`pq`/`pqd`, after `quant_q8`) and the
+router weights go to the host, `cpu::compute_misses` runs the jobs (one per (token, expert); it now takes any number
+of columns per expert, 8 at a time over the same 32 rows, so the weight bytes are read from RAM once), and its sums
+come back as one row per token that has any; `moe_combine` skips those assignments and adds the row.
+
+How N was chosen (120b, profile `oss120.prof`, a 4,096-token document read in chunks, `OSS_PROF=1`, which
+synchronizes: absolute rates are below the real ones). Per 256-token chunk ~560 experts are missing over 36 layers.
+A CPU expert costs ~0.2 ms (reading 12.6 MiB from RAM) + ~0.03 ms per token; a PCIe copy 0.44 ms, so they break even
+near 8 tokens.
+
+| cap N (256-token chunks) | experts ms / chunk | streamed | on the CPU (CPU ms) | prompt tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| off | 279.2 | ~560 | 0 | 800 |
+| 2 | 169.4 | - | - (64.0) | 1,214 |
+| 4 | 146.0 | 183 | 377 (87.8) | 1,363 |
+| 8 | 145.0 | - | - (110.1) | 1,368 |
+| 16 | 160.7 | 50 | 509 (135.7) | 1,262 |
+| 32 | 187.6 | 18 | 539 (165.8) | 1,113 |
+| all | 227.4 | 0 | all (206.5) | 946 |
+
+| chunk (same document) | off | N = 8 |
+| --- | ---: | ---: |
+| 64 | 363 | 564 |
+| 128 | 540 | 895 |
+| 512 | 1,222 | 2,014 |
+| 1,024 | 1,887 | 2,661 |
+| 4,096 | 3,008 | 3,177 (N = 4: 3,064) |
+
+The real case, through `--serve` (no profiling, `--no-spec`, adaptation off): a 12,000-token prompt, then follow-ups
+that reuse it and add N new tokens (two runs each):
+
+| new tokens | before | `--prompt-cpu 8` |
+| ---: | ---: | ---: |
+| 32 | 215-233 tok/s | 336-341 |
+| 64 | 312-404 | 533-639 |
+| 128 | 510-524 | 852-912 |
+| 256 | 717-781 | 1,193-1,291 |
+| 512 | 1,122-1,168 | 1,783-1,797 |
+| 1,024 | 1,611-1,623 | 2,171-2,180 |
+| the 12,000-token prompt itself | 2,867 | 3,114 |
+
+- Output speed unchanged (98.96 vs 98.83 tok/s, 256 greedy tokens); the CPU's buffers cost 2 expert slots of 3,265.
+- Correctness, 20b, 2,000-token document, half the experts in RAM (`--max-slots 384`): perplexity 23.455 (streamed)
+  vs 23.240 (N = 8, 256-token chunks, KL 0.016) and 23.463 (N = 8, 4,096-token chunks, KL 0.007); with every miss on
+  the CPU 23.633 (KL 0.021); the decode path (CPU misses as always) 24.030. All in the band of the engine's own paths.
+  `--prompt-cpu 0` gives byte-identical logits to the engine before this change.
+- 20b, half in RAM, 256-token chunks: 931 -> 1,101 tok/s at N = 8, but 388 with every miss on the CPU: there the
+  missing experts include hot ones, and a hot expert on the CPU is compute-bound. Hence the cap per expert, not a
+  chunk-size threshold.

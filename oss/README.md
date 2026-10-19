@@ -51,6 +51,7 @@ without `--api-key`. Engine flags go after `--`:
 | `--parallel N` | 1 | conversations at once (1-8); each has its own KV cache: ~68 expert slots per 16K of context |
 | `--draft-window N` | 4096 | the EAGLE3 draft's attention window (0: the whole context) |
 | `--chunk N` | 4096 | prompt chunk; 8192 is faster for long documents but takes expert slots |
+| `--prompt-cpu N` | 8 | a prompt chunk's RAM expert used by at most N of its tokens runs on the CPU instead of crossing PCIe (0: off) |
 | `--profile FILE` | none | read the expert profile at start, write the learned one at exit; first start is slower |
 | `--gpus 0,1` / `--split 12,24` | all / by free VRAM | which GPUs, and how many layers each |
 | `--no-spec` | drafts on | no speculative drafts (prompt lookup, EAGLE3) |

@@ -17,6 +17,8 @@ struct Options {
     int ctx = 32768;                 // max context
     int swa_slack = 8192;            // a sliding-window layer keeps window + this many positions (rollback room)
     int chunk = 4096;                // prompt chunk (measured: oss/FINDINGS.md section 12)
+    int prompt_cpu = 8;              // a prompt chunk's RAM expert used by at most this many of its tokens is computed
+                                     // by the CPU instead of streamed over PCIe (0: off; oss/FINDINGS.md section 22)
     int threads = 0;                 // CPU workers (0: physical cores)
     double reserve_mib = 768;        // VRAM left free per GPU
     int64_t max_slots = -1;          // cap on expert slots in total (tests)

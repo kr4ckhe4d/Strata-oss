@@ -167,6 +167,7 @@ void usage() {
     std::fprintf(stderr,
                  "strata-oss --model FILE.gguf [--gpus 0,1] [--split 12,24] [--ctx N] [--chunk N] [--prompt-cpu N] [--threads N]\n"
                  "           [--reserve-mib N] [--max-slots N] [--profile FILE] [--adapt-every N] [--adapt-swaps N]\n"
+                 "           [--read-piece N] [--read-share F]\n"
                  "           (--serve | --tokens FILE [--n-predict N] | --dump-logits OUT --tokens FILE)\n");
 }
 
@@ -178,6 +179,9 @@ int main(int argc, char** argv) {
     int n_predict = 128;
     bool spec = true;
     int draft_max = 7;
+    int read_piece = -1;       // --serve: a new prompt is read this many tokens at a time while others answer (0: at
+                               // once; default: the chunk, which keeps the answers token-identical: FINDINGS.md section 23)
+    double read_share = 0.5;   // the share of the time the new prompt gets then
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -211,9 +215,12 @@ int main(int argc, char** argv) {
         else if (a == "--draft-vocab") o.draft_vocab = next();
         else if (a == "--draft-window") o.draft_window = std::atoi(next().c_str());
         else if (a == "--draft-max") draft_max = std::atoi(next().c_str());
+        else if (a == "--read-piece") read_piece = std::atoi(next().c_str());
+        else if (a == "--read-share") read_share = std::atof(next().c_str());
         else if (a == "-v") o.verbose = true;
         else { usage(); return 2; }
     }
+    if (read_piece < 0) read_piece = o.chunk;
     if (o.model.empty()) { usage(); return 2; }
     try {
         oss::Engine eng(o);
@@ -348,7 +355,9 @@ int main(int argc, char** argv) {
             return 0;
         }
         // ---- serve: up to --parallel answers at once.  A reader thread queues the requests; the loop reads one new
-        // prompt at a time, then advances every answer: alone with speculation, together in one batched step.
+        // prompt at a time, then advances every answer: alone with speculation, together in one batched step.  While
+        // others are answering, the new prompt is read in pieces of --read-piece tokens, and between two pieces the
+        // answers run until the prompt has had --read-share of the time (so they do not stop for a long prompt).
         std::deque<std::string> q;
         std::mutex mu;
         std::condition_variable cv;
@@ -382,8 +391,12 @@ int main(int argc, char** argv) {
             std::chrono::steady_clock::time_point t0;
             double t_prompt = 0;
             uint64_t routed0 = 0, hits0 = 0;  // the engine's routing counters when the answer started
+            std::vector<int32_t> rest;        // the prompt's tokens still to read (from `rd` on)
+            size_t rd = 0;
         };
         std::vector<std::unique_ptr<Req>> active, waiting;
+        std::unique_ptr<Req> reading;  // the prompt being read
+        double owed = 0;               // seconds the answers may still run before the next piece of it
         std::vector<char> slot_busy((size_t) eng.n_seqs(), 0);
         auto jstr = [](const std::string& x) {
             std::string r = "\"";
@@ -418,9 +431,9 @@ int main(int argc, char** argv) {
             // 1. take requests
             {
                 std::unique_lock<std::mutex> lk(mu);
-                if (active.empty() && waiting.empty())
+                if (active.empty() && waiting.empty() && !reading)
                     cv.wait(lk, [&] { return !q.empty() || eof.load(); });
-                if (q.empty() && eof.load() && active.empty() && waiting.empty()) break;
+                if (q.empty() && eof.load() && active.empty() && waiting.empty() && !reading) break;
                 while (!q.empty()) {
                     const std::string line = q.front();
                     q.pop_front();
@@ -434,6 +447,7 @@ int main(int argc, char** argv) {
                     if (op == "cancel") {
                         for (auto& r : active) if (r->rid == rid) r->cancel = true;
                         for (auto& r : waiting) if (r->rid == rid) r->cancel = true;
+                        if (reading && reading->rid == rid) reading->cancel = true;
                     } else if (op == "stats") {
                         eng.report(stderr);
                         emit("{\"type\":\"stats\"}");
@@ -471,8 +485,9 @@ int main(int argc, char** argv) {
             waiting.erase(std::remove_if(waiting.begin(), waiting.end(), [](auto& r) { return r->cancel; }), waiting.end());
             for (auto& r : active) if (r->cancel && r->slot >= 0) finish(*r, "cancel");
             active.erase(std::remove_if(active.begin(), active.end(), [](auto& r) { return r->slot < 0; }), active.end());
+            if (reading && reading->cancel) { finish(*reading, "cancel"); reading.reset(); }
             // 3. one new prompt: the free slot whose conversation shares the longest prefix with it
-            if (!waiting.empty()) {
+            if (!waiting.empty() && !reading) {
                 int best = -1;
                 size_t best_n = 0;
                 for (int sl = 0; sl < eng.n_seqs(); ++sl) {
@@ -491,20 +506,13 @@ int main(int argc, char** argv) {
                     eng.select(best);
                     try {
                         r->reused = eng.reuse_prefix(r->toks);
-                        std::vector<int32_t> rest(r->toks.begin() + r->reused, r->toks.end());
-                        {
-                            std::ostringstream ss;
-                            ss << "{\"type\":\"start\",\"rid\":" << jstr(r->rid) << ",\"n_prompt\":" << r->toks.size()
-                               << ",\"n_reused\":" << r->reused << ",\"slot\":" << best << "}";
-                            emit(ss.str());
-                        }
-                        const float* lg = eng.eval(rest);
-                        r->t_prompt = std::chrono::duration<double>(std::chrono::steady_clock::now() - r->t0).count();
-                        r->gen = std::make_unique<oss::Generator>(eng, r->smp);
-                        r->gen->spec = r->spec;
-                        r->gen->max_draft = draft_max;
-                        r->gen->begin(lg);
-                        active.push_back(std::move(r));
+                        r->rest.assign(r->toks.begin() + r->reused, r->toks.end());
+                        std::ostringstream ss;
+                        ss << "{\"type\":\"start\",\"rid\":" << jstr(r->rid) << ",\"n_prompt\":" << r->toks.size()
+                           << ",\"n_reused\":" << r->reused << ",\"slot\":" << best << "}";
+                        emit(ss.str());
+                        reading = std::move(r);
+                        owed = 0;
                     } catch (std::exception& e) {
                         emit("{\"type\":\"error\",\"rid\":" + jstr(r->rid) + ",\"error\":" + jstr(e.what()) + "}");
                         eng.reuse_prefix({});
@@ -512,6 +520,37 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            // the prompt being read: all of it when nothing else is answering, else its next piece once the answers
+            // have had their time
+            if (reading && (active.empty() || owed <= 0)) {
+                Req& r = *reading;
+                eng.select(r.slot);
+                try {
+                    const bool all = active.empty() || read_piece <= 0;
+                    const size_t n = all ? r.rest.size() - r.rd : std::min(r.rest.size() - r.rd, (size_t) read_piece);
+                    const auto tp = std::chrono::steady_clock::now();
+                    const float* lg = eng.eval(std::vector<int32_t>(r.rest.begin() + r.rd, r.rest.begin() + r.rd + n));
+                    r.rd += n;
+                    const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count();
+                    owed = dt * (1 - read_share) / std::max(read_share, 0.01);
+                    if (r.rd == r.rest.size()) {
+                        r.t_prompt = std::chrono::duration<double>(std::chrono::steady_clock::now() - r.t0).count();
+                        r.gen = std::make_unique<oss::Generator>(eng, r.smp);
+                        r.gen->spec = r.spec;
+                        r.gen->max_draft = draft_max;
+                        r.gen->begin(lg);
+                        r.rest.clear();
+                        active.push_back(std::move(reading));
+                        owed = 0;
+                    }
+                } catch (std::exception& e) {
+                    emit("{\"type\":\"error\",\"rid\":" + jstr(r.rid) + ",\"error\":" + jstr(e.what()) + "}");
+                    eng.reuse_prefix({});
+                    slot_busy[(size_t) r.slot] = 0;
+                    reading.reset();
+                }
+            }
+            const auto t4 = std::chrono::steady_clock::now();
             // 4. advance the answers
             try {
                 if (active.size() == 1) {
@@ -553,7 +592,8 @@ int main(int argc, char** argv) {
                 }
             }
             active.erase(std::remove_if(active.begin(), active.end(), [](auto& r) { return r->slot < 0; }), active.end());
-            if (active.empty() && waiting.empty()) {
+            if (reading) owed -= std::chrono::duration<double>(std::chrono::steady_clock::now() - t4).count();
+            if (active.empty() && waiting.empty() && !reading) {
                 eng.set_busy(false);
                 eng.report(stderr);
             }

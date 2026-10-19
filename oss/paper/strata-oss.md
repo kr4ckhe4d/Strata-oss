@@ -470,9 +470,11 @@ and let the EAGLE3 draft cost 75 expert slots. All three were addressed after th
 - **HIP / RDNA4 only.** The WMMA kernels are gfx1200/1201 only (gfx11's fragment layout differs); other AMD GPUs
   fall back to dp4a and hipBLAS, untested. The engine has no CUDA build. These are not addressed because the
   hardware to build and validate them is not available here.
-- **A new prompt pauses the other conversations** while it is read; batched steps use no drafts.
-- **PCIe bounds long prompts.** Ideas: keep a prompt's most-used missing experts resident across chunks, let the CPU
-  compute the coldest experts of short prompts (Strata's "prompt CPU share"), and compress streamed experts.
+- **Batched steps use no drafts.** (A new prompt is now read in pieces between the other answers' steps:
+  FINDINGS.md section 23.)
+- **PCIe bounds long prompts.** The CPU now computes a chunk's missing experts that at most 8 of its tokens use
+  (FINDINGS.md section 22). Ideas left: keep a prompt's most-used missing experts resident across chunks, and
+  compress streamed experts.
 - **Not measured:** llama.cpp at 16K/32K on this PC, gpt-oss-20b with EAGLE3, Windows, other machines.
 
 ## 8. Reproducing

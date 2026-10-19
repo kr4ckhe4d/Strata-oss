@@ -367,7 +367,7 @@ decode path, which rounds differently from the prompt path; reading the whole pr
 - Each slot's KV cache at 16K costs ~68 expert slots, so choose `--parallel` and `--ctx` together.
 - Through the HTTP server (`-- --parallel 4`, EAGLE3 loaded): 4 simultaneous chat requests all answered correctly;
   a lone request still gets EAGLE3 drafts.
-- Not done: reading a new prompt while others decode (it blocks them for its duration), drafts in batched steps.
+- Not done: drafts in batched steps. (Reading a new prompt while others decode: section 23.)
 
 ## 21. Strata's dashboard on the gpt-oss server
 
@@ -438,3 +438,34 @@ that reuse it and add N new tokens (two runs each):
 - 20b, half in RAM, 256-token chunks: 931 -> 1,101 tok/s at N = 8, but 388 with every miss on the CPU: there the
   missing experts include hot ones, and a hot expert on the CPU is compute-bound. Hence the cap per expert, not a
   chunk-size threshold.
+
+## 23. A new prompt no longer stops the running answers (`--read-piece N`, `--read-share F`)
+
+Before, the `--serve` loop read a new prompt in one `eval`, and every running answer waited for it. Now, while other
+answers are running, the prompt is read in pieces of `--read-piece` tokens (default: the chunk, 4,096). After each
+piece the answers run until the prompt has had `--read-share` of the time (default 0.5). A prompt that arrives when
+nothing else is answering is still read in one go, as before. A request cancelled while its prompt is read keeps the
+part already read as a reusable prefix of its slot.
+
+120b, `--parallel 2 --no-spec --adapt-every 0`, greedy. Answer A (a 640-token prompt, 1,500 tokens) is running when
+request B (a 16,000-token prompt, 100 tokens) arrives:
+
+| | A alone | A while B is read | A's longest pause | B's prompt |
+| --- | ---: | ---: | ---: | ---: |
+| before (`--read-piece 0`) | 92.9 tok/s | 0.4 tok/s | 5,375 ms | 5.37 s |
+| piece 4,096 (default), share 0.5 | 92.9 | 39.6 | 1,465 | 9.39 |
+| piece 2,048, share 0.5 | 92.6 | 43.3 | 817 | 10.81 |
+| piece 1,024, share 0.5 | 92.9 | 44.8 | 491 | 13.08 |
+| piece 512, share 0.5 | 92.7 | 45.4 | 321 | 17.43 |
+| piece 1,024, share 0.25 | 93.0 | 64.3 | 485 | 22.68 |
+| piece 1,024, share 0.75 | 92.7 | 22.9 | 487 | 8.82 |
+
+- Exactness: with the default, both answers are token-identical to `--read-piece 0` (A 1,500 tokens, B 100).
+  Smaller pieces change B after 8 tokens. That comes from section 22, not from the scheduler: the CPU takes the
+  experts used by at most 8 of a *chunk's* tokens, so other chunk boundaries move a few experts between the CPU's and
+  the GPU's rounding. With `--prompt-cpu 0`, 1,024-token pieces are token-identical too (the GPU prompt path gives the
+  same bytes at any chunk size: 20b, chunks of 256 vs 4,096).
+- Smaller pieces read the prompt more slowly (each missing expert crosses PCIe once per piece): 1,024-token pieces
+  took 13.08 s with the CPU path and 18.95 s with `--prompt-cpu 0`.
+- So the default keeps the answers exact and reads B fastest; `--read-piece 1024` gives shorter pauses (0.49 s
+  instead of 1.47 s) for 39% more prompt time, and `--read-share` decides who waits.

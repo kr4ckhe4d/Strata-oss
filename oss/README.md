@@ -52,6 +52,8 @@ without `--api-key`. Engine flags go after `--`:
 | `--draft-window N` | 4096 | the EAGLE3 draft's attention window (0: the whole context) |
 | `--chunk N` | 4096 | prompt chunk; 8192 is faster for long documents but takes expert slots |
 | `--prompt-cpu N` | 8 | a prompt chunk's RAM expert used by at most N of its tokens runs on the CPU instead of crossing PCIe (0: off) |
+| `--read-piece N` | the chunk | while others answer, a new prompt is read N tokens at a time (0: at once, the others wait) |
+| `--read-share F` | 0.5 | the share of the time the new prompt gets between its pieces |
 | `--profile FILE` | none | read the expert profile at start, write the learned one at exit; first start is slower |
 | `--gpus 0,1` / `--split 12,24` | all / by free VRAM | which GPUs, and how many layers each |
 | `--no-spec` | drafts on | no speculative drafts (prompt lookup, EAGLE3) |

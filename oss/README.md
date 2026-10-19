@@ -6,7 +6,8 @@ computed by the CPU at the same time as the GPU computes the cached ones, a prom
 PCIe, and the cache follows the routing (saved as a profile for the next start). The Qwen engine in `src/` is not
 touched; this is its own CMake project.
 
-Measured numbers, what each one ran on, and why each bottleneck was there: [FINDINGS.md](FINDINGS.md). In short, on
+Measured numbers, what each one ran on, and why each bottleneck was there: [FINDINGS.md](FINDINGS.md). The design,
+explained: [paper/strata-oss.md](paper/strata-oss.md). Porting another model: [PORTING.md](PORTING.md). In short, on
 a Ryzen 7 9800X3D with 30 GB of RAM and an RX 9070 XT 16 GB + Radeon AI PRO R9700 32 GB: output 91-101 tok/s
 (116-131 with the EAGLE3 draft), prompts 1,800-2,700 tok/s; llama.cpp's best hybrid split on the same PC: 50.5 and
 791.
